@@ -48,8 +48,8 @@ export ANTHROPIC_API_KEY="your-key-here"  # If using Anthropic models
 ```bash
 python main.py \
     --model_name "Qwen/Qwen2.5-1.5B-Instruct" \
-    --judge_model_name "gpt-4" \
-    --compare_model_name "gpt-4" \
+    --judge_model_name "gpt-4o" \
+    --compare_model_name "gpt-4o-mini" \
     --dataset_name "debate" \
     --output_dir "output"
 ```
@@ -85,9 +85,9 @@ Final debate position
 The debate framework demonstrates the effectiveness of GRPO training:
 
 ![Training Progress](figures/win_rate.png)
-*Win rate of Qwen 2.5-1.5B vs GPT-4-mini throughout training, showing improvement from 3% to >95% win rate*
+*Win rate of Qwen 2.5-1.5B vs GPT-4o-mini throughout training, showing improvement from 3% to >95% win rate*
 
-1. **Base Model vs GPT-4 Performance**:
+1. **Base Model vs GPT-4o Performance**:
    - Initial performance: 3% win rate
    - Final performance: >95% win rate
    - Shows significant improvement in debate capabilities
@@ -95,7 +95,7 @@ The debate framework demonstrates the effectiveness of GRPO training:
 2. **Cross-Model Generalization**:
    - Initial model performance: 30% win rate
    - Fine-tuned model performance: >95% win rate
-   - Results achieved with a different judge (GPT-4) than training
+   - Results achieved with a different judge (GPT-4o) than training
    - Demonstrates robust improvement beyond reward hacking
 
 ### Future Applications
