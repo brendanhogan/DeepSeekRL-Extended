@@ -8,6 +8,7 @@ import argparse
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
+from model_interface import ModelInterface
 
 import llms
 import utils
@@ -15,8 +16,7 @@ import evaluator
 import rldatasets
 
 def eval_on_test_set(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
+    all_models: dict,
     test_loader: rldatasets.DataLoader,
     eval_class: evaluator.RewardEvaluator,
     device: str,
@@ -24,94 +24,176 @@ def eval_on_test_set(
     round_num: int
 ) -> tuple[dict[str, float], float]:
     """
-    Evaluate model performance on test set.
-    
-    Args:
-        model: The model to evaluate
-        tokenizer: Tokenizer for the model
-        test_loader: DataLoader for test set
-        eval_class: Evaluator for computing rewards
-        device: Device to run on
-        args: Training arguments
-        round_num: Current training round number
-        
-    Returns:
-        total_scores: Dictionary of average metrics
-        accuracy: Accuracy on test set
+    Evaluate model performance on test set by comparing each model completion
+    against a base model completion and having them judged.
     """
     print("Running evaluation on test set...")
     
-    # Track metrics across all test examples
     total_scores = defaultdict(float)
     num_examples = 0
-    total_accuracy = 0.0
+    total_wins = 0
 
-    # Create log file for this evaluation round
     log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
     test_loader.reset()
     
     with open(log_file, 'w') as f:
-        # Run through test set
-        for question, answer in tqdm(test_loader, desc="Evaluating on test set"):
-            # Generate completions using same function as training
-            _, _, _, _, completions_text, _ = generate_completions(
-                model, tokenizer, question, device, args
-            )
-            
-            # Score completions using evaluator
-            mock_prompts = [[{'content': question}]] * len(completions_text)
-            mock_completions = [[{'content': completion}] for completion in completions_text]
-            # Make answer array same length as completions
-            answers = [answer] * len(completions_text)
-            rewards_per_func, metrics = eval_class.compute_rewards(
-                prompts=mock_prompts,
-                completions=mock_completions, 
-                answer=answers,
-                device=device
-            )
-            
-            # Track accuracy and accumulate metrics
-            total_accuracy += metrics['accuracy']
-                
-            for k, v in metrics.items():
-                total_scores[k] += v
+        total_debates = 0
+        total_wins = 0
+        
+        for question in tqdm(test_loader, desc="Evaluating on test set"):
             num_examples += 1
 
-            # Log this example
-            f.write("\n" + "="*50 + "\n")
-            f.write(f"Q# {num_examples}\n")
-            f.write(f"Question: {question}\n")
-            f.write(f"Response: {completions_text[0]}\n") # Log first completion
-            f.write(f"Ground Truth: {answer}\n")
-            f.write("Metrics:\n")
-            for metric, value in metrics.items():
-                f.write(f"{metric}: {value}\n")
-            f.write(f"Total Score: {rewards_per_func.sum().item()}\n")
+            # 1. Prepare prompting
+            prompt = [
+                {'role': 'system', 'content': test_loader.pre_prompt},
+                {'role': 'user', 'content': question}
+            ]
+            prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False)
 
+            # Log Initial prompt 
+            f.write("\n" + "="*80 + "\n")
+            f.write(f"Example #{num_examples}\n")
+            f.write("="*80 + "\n\n")
+            
+            f.write("Prompt:\n")
+            f.write(f"{prompt_text}\n\n")
 
-    # Calculate averages
-    avg_scores = {k: v/num_examples for k,v in total_scores.items()}
-    accuracy = total_accuracy / num_examples * 100
+            # Generate completions from trained model
+            _, _, _, _, completions_text, _ = generate_completions(
+                all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args
+            )
 
-    # Save metrics
+            # Generate completions for compare model using the interface
+            compare_completions_text = []
+            for _ in range(args.num_chains):
+                completion = all_models["compare_model"].generate(
+                    system_prompt=test_loader.pre_prompt,
+                    user_prompt=question,
+                    max_new_tokens=args.max_completion_length,
+                    temperature=args.temperature
+                )
+                compare_completions_text.append(completion)
+
+            # Score completions to get reward metrics
+            rewards_per_func, reward_metrics = eval_class.compute_rewards(
+                input_prompt=question, 
+                all_models=all_models, 
+                train_model_completions=completions_text, 
+                compare_model_completions=compare_completions_text,
+                device=device,
+                is_test=True
+            )
+
+            # Track total debates and wins
+            debates_this_question = len(completions_text)
+            total_debates += debates_this_question
+            total_wins += reward_metrics['num_wins']
+
+            # For each completion pair, log the results
+            for i, (completion, compare_completion) in enumerate(zip(completions_text, compare_completions_text)):
+                f.write(f"\nCompletion #{i+1}:\n")
+                f.write("-"*40 + "\n\n")
+
+                # Log trained model's response
+                f.write("TRAINED MODEL RESPONSE:\n")
+                f.write(f"Full response:\n{completion}\n\n")
+                
+                try:
+                    trained_reasoning = completion.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
+                    trained_answer = completion.split("<answer>\n")[1].split("\n</answer>")[0]
+                except:
+                    trained_reasoning = "ERROR: Could not parse reasoning"
+                    trained_answer = "ERROR: Could not parse answer"
+                
+                f.write(f"Parsed reasoning:\n{trained_reasoning}\n")
+                f.write(f"Parsed answer:\n{trained_answer}\n\n")
+
+                # Log compare model's response
+                f.write("COMPARE MODEL RESPONSE:\n")
+                f.write(f"Full response:\n{compare_completion}\n\n")
+                
+                try:
+                    compare_reasoning = compare_completion.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
+                    compare_answer = compare_completion.split("<answer>\n")[1].split("\n</answer>")[0]
+                except:
+                    compare_reasoning = "ERROR: Could not parse reasoning"
+                    compare_answer = "ERROR: Could not parse answer"
+                
+                f.write(f"Parsed reasoning:\n{compare_reasoning}\n")
+                f.write(f"Parsed answer:\n{compare_answer}\n\n")
+
+                # Log reward scores for this completion
+                f.write("REWARD SCORES:\n")
+                reward_breakdown = eval_class.get_reward_breakdown(rewards_per_func[i])
+                for reward_name, reward_value in reward_breakdown.items():
+                    f.write(f"{reward_name}: {reward_value:.4f}\n")
+                f.write(f"Total reward: {rewards_per_func[i].sum().item():.4f}\n")
+
+                # Log if trained model won this debate
+                trained_model_won = rewards_per_func[i,0] > 0
+                f.write(f"\nOUTCOME: Trained model {'won' if trained_model_won else 'lost'} this debate\n")
+                f.write("-"*40 + "\n")
+
+            # Log summary metrics for this question
+            f.write("\nSUMMARY METRICS:\n")
+            f.write(f"Win rate: {reward_metrics['win_rate']:.2%}\n")
+            f.write(f"Number of wins: {reward_metrics['num_wins']}\n")
+            f.write(f"Total debates: {reward_metrics['num_debates']}\n")
+            f.write(f"Average format scores:\n")
+            f.write(f"  Strict format: {reward_metrics['rewards/strict_format']:.4f}\n")
+            f.write(f"  Soft format: {reward_metrics['rewards/soft_format']:.4f}\n")
+            f.write(f"  XML count: {reward_metrics['rewards/xml_count']:.4f}\n")
+
+            # Update total scores
+            for k, v in reward_metrics.items():
+                if k.startswith('rewards/'):
+                    total_scores[k] += v
+        
+        # Calculate final metrics
+        win_rate = (total_wins / total_debates) * 100 if total_debates > 0 else 0
+        avg_scores = {k: v/num_examples for k,v in total_scores.items()}
+
+        # Save metrics
+        metrics = {
+            'win_rate': win_rate,
+            'total_wins': total_wins,
+            'total_debates': total_debates,
+            'num_examples': num_examples,
+            'average_scores': avg_scores
+        }
+
+        # Write summary results to file and optionally print
+        f.write("\nFINAL EVALUATION RESULTS:\n")
+        f.write("-" * 20 + "\n")
+        f.write(f"Win Rate: {win_rate:.2f}%\n")
+        f.write(f"Total Wins: {total_wins}\n") 
+        f.write(f"Total Debates: {total_debates}\n")
+        f.write("\nAverage Scores:\n")
+        for metric, value in avg_scores.items():
+            f.write(f"{metric:15s}: {value:.4f}\n")
+        f.write("-" * 20 + "\n")
+
+        if args.verbose:
+            print("\nEvaluation Results:")
+            print("-" * 20)
+            print(f"Win Rate: {win_rate:.2f}%")
+            print(f"Total Wins: {total_wins}")
+            print(f"Total Debates: {total_debates}")
+            print("\nAverage Scores:")
+            for metric, value in avg_scores.items():
+                print(f"{metric:15s}: {value:.4f}")
+            print("-" * 20)
+
     metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
     with open(metrics_path, 'w') as f:
-        json.dump({**avg_scores, 'accuracy': accuracy}, f, indent=4)
+        json.dump(metrics, f, indent=4)
 
-    if args.verbose:
-        print("\nEvaluation Results:")
-        print("-" * 20)
-        print(f"Accuracy: {accuracy:.2f}%")
-        for metric, value in avg_scores.items():
-            print(f"{metric:15s}: {value:.4f}")
-        print("-" * 20)
-
-    return avg_scores, accuracy
+    return metrics, win_rate
 
 def generate_completions(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase, 
-    question: str,
+    prompt_text: str,
     device: str,
     args: argparse.Namespace
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], str]:
@@ -121,7 +203,7 @@ def generate_completions(
     Args:
         model: The language model to use for generation
         tokenizer: Tokenizer corresponding to the model
-        question: The input question/prompt to generate completions for
+        prompt_text: The input question/prompt to generate completions for - should be full prompt ready to be turned into token ids (i.e. chat template applied etc)
         device: Device to run generation on ('cpu' or 'cuda')
         args: Namespace containing generation parameters
         
@@ -133,12 +215,8 @@ def generate_completions(
         completions_text: List of decoded completion texts
         prompt_text: The full formatted prompt text
     """
-    # 1. Prepare prompting
-    prompt = [
-        {'role': 'system', 'content': train_loader.system_prompt},
-        {'role': 'user', 'content': question}
-    ]
-    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False)
+
+    # Tokenize
     prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
@@ -191,7 +269,6 @@ def generate_completions(
 def score_completions(
     completions_text: list[str],
     question: str,
-    answer: str,
     eval_class: evaluator.RewardEvaluator,
     device: str,
     args: argparse.Namespace
@@ -218,24 +295,22 @@ def score_completions(
     log_data = {
         'prompt': {
             'text': question,
-            'answer': answer
         },
         'generations': []
     }
 
     # Format inputs as expected by evaluator
-    mock_prompts = [[{'content': question}]] * len(completions_text)
-    mock_completions = [[{'content': completion}] for completion in completions_text]
-    answers = [answer] * len(completions_text)
-    
     # Get rewards and metrics from evaluator
     rewards_per_func, metrics = eval_class.compute_rewards(
-        prompts=mock_prompts,
-        completions=mock_completions,
-        answer=answers,
-        device=device
+        input_prompt=question,
+        all_models=all_models, 
+        train_model_completions=completions_text, 
+        compare_model_completions=None,
+        device=device, 
+        is_test=False
     )
     rewards = rewards_per_func.sum(dim=1)
+
 
     # Store generation data
     for i, (completion, reward_scores) in enumerate(zip(completions_text, rewards_per_func)):
@@ -326,11 +401,9 @@ def compute_loss(
     return loss, metrics
 
 def grpo_loss(
-        model: PreTrainedModel,
-        base_model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizerBase,
+        train_loader,
+        all_models: dict,
         question: str,
-        answer: str,
         eval_class: evaluator.RewardEvaluator,
         device: str,
         round_num: int,
@@ -357,14 +430,20 @@ def grpo_loss(
         metrics: Dictionary containing training metrics
         reward: The total reward for this batch
     """
-    # Generate completions
-    prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text = generate_completions(
-        model, tokenizer, question, device, args
-    )
 
+    prompt = [
+        {'role': 'system', 'content': test_loader.pre_prompt},
+        {'role': 'user', 'content': question}
+    ]
+    prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False)
+
+    # Generate completions
+    prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, _ = generate_completions(
+        all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args
+    )
     # Score completions
     rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
-        completions_text, question, answer, eval_class, device, args
+        completions_text, question, eval_class, device, args
     )
 
     # Write log data
@@ -374,7 +453,7 @@ def grpo_loss(
     # Compute loss
     completion_mask = attention_mask[:, prompt_ids.size(1):]
     loss, loss_metrics = compute_loss(
-        model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
+        all_models["training_model"], all_models["base_model"], prompt_completion_ids, prompt_ids, completion_ids,
         attention_mask, completion_mask, advantages, args
     )
 
@@ -383,20 +462,22 @@ def grpo_loss(
 
     return loss, metrics
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
     
     # Model configuration
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name/path of base model")
-    parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset to use for training")
-    parser.add_argument("--evaluator", type=str, default="gsm8k", help="Evaluator to use for scoring")
+    parser.add_argument("--judge_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name of model to use as judge")
+    parser.add_argument("--compare_model_name", type=str, default="gpt-4o-mini", help="Name of model to use for comparison")
+    parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate"], help="Dataset to use for training")
+    parser.add_argument("--evaluator", type=str, default="debate", choices=["debate"], help="Evaluator to use for scoring")
 
     # Output and logging
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--save_steps", type=int, default=100, help="Save model every N steps")
-    parser.add_argument("--eval_iterations", type=int, default=20, help="Number of iterations for evaluation")
+    parser.add_argument("--save_steps", type=int, default=80, help="Save model every N steps")
+    parser.add_argument("--eval_iterations", type=int, default=40, help="Number of iterations for evaluation")
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
 
     # Optimization hyperparameters
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
@@ -438,21 +519,29 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
     torch.set_float32_matmul_precision('high') 
 
-    ###############################
-    ## Main Experiment settings ##
-    ###############################
-
     ## Set which model to train 
     model, tokenizer = llms.get_llm_tokenizer(args.model_name, device)
     base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
+
+    # Get judge and compare models using the new interfaces
+    judge_model = llms.get_judge_model(args.judge_model_name, device)
+    compare_model = llms.get_compare_model(args.compare_model_name, device)
+    
+    # Simplified all_models dictionary
+    all_models = {
+        "training_model": model,
+        "training_model_tokenizer": tokenizer,
+        "base_model": base_model,
+        "base_model_tokenizer": tokenizer,
+        "judge_model": judge_model,
+        "compare_model": compare_model
+    }
 
     ## Set which data set 
     train_loader, test_loader = rldatasets.get_dataloaders(args.dataset_name)
 
     ## Set which evaluation criteria to use 
     eval_class = evaluator.get_evaluator(args.evaluator)
-
-    ###############################
 
 
     # Setup logging 
@@ -465,11 +554,12 @@ if __name__ == "__main__":
     os.makedirs(eval_log_dir, exist_ok=True)
     train_log_dir = os.path.join(args.output_dir, 'training_logs')
     os.makedirs(train_log_dir, exist_ok=True)
-
+    checkpoint_dir = os.path.join(args.output_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Setup optimizer for trainer agent with GRPO config settings
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        all_models["training_model"].parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
@@ -484,24 +574,43 @@ if __name__ == "__main__":
         return 1.0
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda=get_lr)
 
+    # Resume from checkpoint if requested
+    start_round = 0
+    if args.resume:
+        checkpoints = sorted([int(f.split('_')[1].split('.')[0]) for f in os.listdir(checkpoint_dir) if f.startswith('step_')])
+        if checkpoints:
+            latest_checkpoint = checkpoints[-1]
+            checkpoint_path = os.path.join(checkpoint_dir, f'step_{latest_checkpoint}.pt')
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_round = checkpoint['round_num'] + 1
+            train_metrics_total = checkpoint['train_metrics_total']
+            print(f"Resuming from checkpoint at step {latest_checkpoint}")
+        else:
+            print("No checkpoints found, starting from scratch")
+            train_metrics_total = {}
+    else:
+        train_metrics_total = {}
 
     # Begin training 
     accumulated_loss = 0
     optimizer.zero_grad()
-    train_metrics_total = {}
-    for round_num in tqdm(range(args.num_train_iters), desc="Training Progress"):
-    
+
+    for round_num in tqdm(range(start_round, args.num_train_iters), desc="Training Progress"):
+        print(f"Round {round_num}")
         # Evaluate on test set every so often 
         if round_num % args.eval_iterations == 0:
             eval_metrics, eval_accuracy = eval_on_test_set(
-                model=model,
-                tokenizer=tokenizer, 
+                all_models=all_models,
                 test_loader=test_loader,
                 eval_class=eval_class,
                 device=device,
                 args=args,
                 round_num=round_num
             )
+
             
             # Save metrics to eval log dir
             metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
@@ -511,6 +620,17 @@ if __name__ == "__main__":
                     'accuracy': eval_accuracy
                 }, f, indent=4)
 
+        # Save checkpoint
+        if (round_num + 1) % args.save_steps == 0:
+            checkpoint_path = os.path.join(checkpoint_dir, f'step_{round_num}.pt')
+            torch.save({
+                'round_num': round_num,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_metrics_total': train_metrics_total
+            }, checkpoint_path)
+
         # Slowly update ref model
         if args.update_ref_model and (round_num+1) % args.update_ref_model_freq == 0:
             with torch.no_grad():
@@ -518,13 +638,13 @@ if __name__ == "__main__":
                     ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
 
         # Get next question
-        question, answer = next(train_loader)
+        question = next(train_loader)
 
         # Do GRPO - generate chains, score, compute advantage, compute loss 
-        total_loss, train_metrics = grpo_loss(model, base_model, tokenizer, question, answer, eval_class, device, round_num, train_log_dir, args)
+        total_loss, train_metrics = grpo_loss(train_loader, all_models, question, eval_class, device, round_num, train_log_dir, args)
         
         # Gradient accumulation
-        total_loss = total_loss # / args.gradient_accumulation_steps
+        total_loss = total_loss
         total_loss.backward()
         accumulated_loss += total_loss.item()
         scheduler.step()
@@ -543,4 +663,7 @@ if __name__ == "__main__":
         train_metrics_total[round_num] = train_metrics
         with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:
             json.dump(train_metrics_total, f, indent=4)
-       
+
+        # Add after each major operation in the training loop
+        torch.cuda.empty_cache()
+    

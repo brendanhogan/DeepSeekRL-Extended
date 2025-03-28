@@ -4,6 +4,7 @@ Module for loading LLMs and their tokenizers from huggingface.
 """
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizerBase
+from model_interface import ModelInterface, HuggingFaceModel, OpenAIModel, AnthropicModel
 
 
 def get_llm_tokenizer(model_name: str, device: str) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
@@ -31,3 +32,43 @@ def get_llm_tokenizer(model_name: str, device: str) -> tuple[PreTrainedModel, Pr
     model.config.pad_token_id = tokenizer.pad_token_id
     
     return model, tokenizer
+
+def get_judge_model(model_name: str, device: str) -> ModelInterface:
+    """
+    Create a judge model interface based on the model name.
+    
+    Args:
+        model_name: Name of the model to use (can be HF model name or API model name)
+        device: Device to load the model on ('cpu' or 'cuda')
+        
+    Returns:
+        ModelInterface: The judge model interface
+    """
+    if model_name.startswith(('gpt-', 'claude-')):
+        if model_name.startswith('gpt-'):
+            return OpenAIModel(model_name)
+        else:
+            return AnthropicModel(model_name)
+    else:
+        model, tokenizer = get_llm_tokenizer(model_name, device)
+        return HuggingFaceModel(model, tokenizer, device)
+
+def get_compare_model(model_name: str, device: str) -> ModelInterface:
+    """
+    Create a compare model interface based on the model name.
+    
+    Args:
+        model_name: Name of the model to use (can be HF model name or API model name)
+        device: Device to load the model on ('cpu' or 'cuda')
+        
+    Returns:
+        ModelInterface: The compare model interface
+    """
+    if model_name.startswith(('gpt-', 'claude-')):
+        if model_name.startswith('gpt-'):
+            return OpenAIModel(model_name)
+        else:
+            return AnthropicModel(model_name)
+    else:
+        model, tokenizer = get_llm_tokenizer(model_name, device)
+        return HuggingFaceModel(model, tokenizer, device)

@@ -53,22 +53,31 @@ def write_generation_log(log_data: Dict[str, Any], log_file: str) -> None:
         # Write prompt section
         f.write("###### ORIGINAL PROMPT #####\n\n")
         f.write(log_data['prompt']['text'] + "\n\n")
-        f.write("#### ANS ####\n\n")
-        f.write(str(log_data['prompt']['answer']) + "\n")
 
         # Write each generation
         for i, gen in enumerate(log_data['generations'], 1):
-            f.write(f"#### GENERATION {i} RESPONSE ####\n\n")
+            f.write(f"#### GENERATION {i} ####\n\n")
+            f.write("RESPONSE:\n")
             f.write(gen['response'] + "\n\n")
-            f.write(f"#### GENERATION {i} SCORES ####\n")
             
-            # Write individual scores
-            f.write(f"Correctness: {gen['scores']['correctness']}\n")
-            f.write(f"Integer format: {gen['scores']['integer_format']}\n") 
-            f.write(f"Strict format: {gen['scores']['strict_format']}\n")
-            f.write(f"Soft format: {gen['scores']['soft_format']}\n")
-            f.write(f"XML count: {gen['scores']['xml_count']}\n")
-            f.write(f"Total reward: {gen['scores']['total_reward']}\n\n")
+            # Parse XML sections if present
+            try:
+                reasoning = gen['response'].split("<reasoning>\n")[1].split("\n</reasoning>")[0]
+                answer = gen['response'].split("<answer>\n")[1].split("\n</answer>")[0]
+                f.write("PARSED SECTIONS:\n")
+                f.write(f"Reasoning:\n{reasoning}\n")
+                f.write(f"Answer:\n{answer}\n\n")
+            except:
+                f.write("ERROR: Could not parse XML sections\n\n")
+            
+            # Write reward scores
+            f.write("REWARD SCORES:\n")
+            for reward_name, reward_value in gen['scores'].items():
+                f.write(f"{reward_name}: {reward_value:.4f}\n")
+            # Total reward is sum of individual scores
+            total_reward = sum(gen['scores'].values())
+            f.write(f"Total reward: {total_reward:.4f}\n\n")
+            f.write("-"*40 + "\n\n")
 
 
 ####################################################################################

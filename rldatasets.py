@@ -64,113 +64,140 @@ Respond in the following format:
 
 
 
-class GSM8KLoader(DataLoader):
-    """
-    A loader class that provides iteration over GSM8K math problems.
-    
-    This class implements both sequential and random access to math problems through
-    standard Python iterator protocols. It can be used to iterate over problems either
-    in order or randomly, making it suitable for both training and evaluation.
-    
-    Attributes:
-        questions (List[str]): List of math question strings
-        answers (List[str]): List of corresponding answer strings
-        random (bool): If True, returns problems randomly; if False, returns sequentially
-        current_index (int): Current position in the lists for sequential access
-    """
-    
-    def __init__(self, questions: list[str], answers: list[str], random: bool = False) -> None:
-        super().__init__(random)
-        self.questions = questions
-        self.answers = answers
-        self.pre_prompt = """You will be given a question that involves reasoning. You should reason carefully about the question, then provide your answer.
-            It is very important that you put your reasoning process inside <reasoning> tags and your final answer inside <answer> tags, like this:
 
-            
+class DebateDataLoader(DataLoader):
+    """
+    A loader class that provides iteration over debate topics.
+    
+    This class implements both sequential and random access to debate topics through
+    standard Python iterator protocols. For each topic, it randomly assigns PRO or CON
+    position to create debate scenarios.
+    """
+    
+    def __init__(self, topics: list[str], random: bool = False) -> None:
+        super().__init__(random)
+        self.topics = topics
+        self.pre_prompt = """You will be given a debate topic and your position (PRO or CON). You should reason carefully about the position, then provide your argument.
+            It is very important that you put your reasoning process inside <reasoning> tags and your final argument inside <answer> tags, like this:
+
             <reasoning>
-            Your step-by-step reasoning process here
+            Your step-by-step reasoning process here, considering key points and potential counterarguments
             </reasoning>
             <answer>
-            Your final answer here
+            Your clear, concise 2-3 sentence debate position
             </answer>
 
-            All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! Start each answer by immediately starting with <reasoning>. 
-            It is is extremely important you answer in this way - do not put any information or text outside of these tags!
-
-            Question: """
-        self.system_prompt = SYSTEM_PROMPT
-        
+            All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! Start each response by immediately starting with <reasoning>. 
+            """
+        self.system_prompt = SYSTEM_PROMPT  # Using the same system prompt as GSM8K
+            
     def __len__(self) -> int:
-        return len(self.questions)
+        return len(self.topics)
         
-    def __iter__(self) -> 'GSM8KLoader':
+    def __iter__(self) -> 'DebateDataLoader':
         return self
         
     def __next__(self) -> tuple[str, str]:
-        if self.current_index >= len(self.questions):
+        if self.current_index >= len(self.topics):
             raise StopIteration
         
         if self.random:
-            idx = random.randint(0, len(self.questions) - 1)
+            idx = random.randint(0, len(self.topics) - 1)
         else:
             idx = self.current_index
             self.current_index += 1
             
-        return self.questions[idx], self.answers[idx]
+        topic = self.topics[idx]
+        position = random.choice(["PRO", "CON"])
+        
+        # Format the question to include both topic and position
+        formatted_question = f"Debate Topic: {topic}\nPosition: {position}"
+        
+        # The "answer" in this case is the position, which is needed for evaluation
+        return formatted_question
 
     def reset(self):
-        self.current_index = 0 
+        self.current_index = 0
 
 
-def build_gsm8k_dataloaders() -> Tuple[GSM8KLoader, GSM8KLoader]: 
-    data = load_dataset('openai/gsm8k', 'main')["train"]
-
-    questions = []
-    parsed_answers = [] 
-    for i in tqdm(range(len(data)), desc="Processing"):
-        # Try to get answer - if is None dont use this sample 
-        ans = extract_hash_answer(data[i]['answer'])
-        if ans is None: 
-            continue 
-        else:
-            questions.append(data[i]['question'])
-            parsed_answers.append(ans)
-
-    # Randomly split into train/test sets
-    total_samples = len(questions)
-    test_size = int(total_samples * 0.01)  # 10% for test set
+def build_debate_dataloaders() -> Tuple[DebateDataLoader, DebateDataLoader]:
+    # Define debate topics - non-controversial but engaging topics
+    topics = [
+        "Video games should be taught as a school sport",
+        "All schools should have mandatory cooking classes",
+        "Homework should be replaced with project-based learning",
+        "Every city should have a night market",
+        "Movie theaters should have special quiet showings",
+        "All schools should teach sign language",
+        "Restaurants should offer smaller portion options",
+        "Public spaces should have musical instruments",
+        "All high schools should start after 9am",
+        "Zoos should focus only on local wildlife",
+        "Libraries should have recording studios",
+        "Every workplace should allow pets",
+        "Schools should teach financial literacy",
+        "All restaurants should show calorie counts",
+        "Museums should be open late on weekends",
+        "Cities should have designated graffiti walls",
+        "Schools should teach basic coding",
+        "Grocery stores should have recipe stations",
+        "All buildings should have rooftop gardens",
+        "Cafes should have board game nights",
+        "Libraries should offer virtual reality rooms",
+        "Parks should have outdoor movie screens",
+        "Schools should teach meditation",
+        "Restaurants should compost food waste",
+        "Cities should have more water fountains",
+        "All schools should have maker spaces",
+        "Gyms should offer childcare",
+        "Libraries should loan art pieces",
+        "Hotels should adopt shelter pets",
+        "Schools should teach gardening",
+        "Airports should have sleeping pods",
+        "Malls should have indoor gardens",
+        "Restaurants should grow their own herbs",
+        "Cities should have free music venues",
+        "Schools should teach public speaking",
+        "Offices should have nap rooms",
+        "Supermarkets should have tasting stations",
+        "Libraries should have podcast studios",
+        "Parks should have outdoor chess tables",
+        "Schools should teach time management",
+        "Restaurants should offer cooking classes",
+        "Cities should have stargazing areas",
+        "Beaches should have free sunscreen",
+        "Schools should teach digital citizenship",
+        "Hotels should have community spaces",
+        "Parks should have fruit trees",
+        "Libraries should offer language exchanges",
+        "Theaters should have subtitle options",
+        "Schools should teach environmental science",
+        "Cities should have interactive art installations"
+    ]
+    # Split into train/test sets (85/15 split)
+    total_topics = len(topics)
+    test_size = int(total_topics * 0.15)
     
     # Generate random indices for test set
-    test_indices = random.sample(range(total_samples), test_size)
+    test_indices = random.sample(range(total_topics), test_size)
     test_indices_set = set(test_indices)
     
-    # Convert to numpy arrays for easier indexing
-    questions = np.array(questions)
-    parsed_answers = np.array(parsed_answers)
+    # Split topics
+    train_topics = [t for i, t in enumerate(topics) if i not in test_indices_set]
+    test_topics = [topics[i] for i in test_indices]
     
-    # Create boolean mask for test indices
-    test_mask = np.zeros(total_samples, dtype=bool)
-    test_mask[list(test_indices_set)] = True
-    
-    # Split using boolean indexing
-    test_questions = questions[test_mask]
-    test_answers = parsed_answers[test_mask]
-    train_questions = questions[~test_mask] 
-    train_answers = parsed_answers[~test_mask]
-
-    # Setup data loaders 
-    trainloader = GSM8KLoader(train_questions.tolist(), train_answers.tolist())
-    testloader = GSM8KLoader(test_questions.tolist(), test_answers.tolist())
+    # Create data loaders
+    trainloader = DebateDataLoader(train_topics, random=True)
+    testloader = DebateDataLoader(test_topics, random=False)
     
     return trainloader, testloader
-
 
 def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     """
     Factory function to get train and test data loaders for a specified dataset.
     
     Args:
-        dataset_name (str): Name of the dataset to load ('gsm8k' currently supported)
+        dataset_name (str): Name of the dataset to load ('gsm8k' or 'debate' currently supported)
         
     Returns:
         Tuple[DataLoader, DataLoader]: Train and test data loaders
@@ -178,11 +205,11 @@ def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     Raises:
         ValueError: If dataset_name is not supported
     """
-    if dataset_name.lower() == 'gsm8k':
-        return build_gsm8k_dataloaders()
+    if dataset_name.lower() == 'debate':
+        return build_debate_dataloaders()
     else:
-        raise ValueError(f"Dataset {dataset_name} not supported. Currently only 'gsm8k' is available.")
+        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate' is available.")
 
 
 if __name__ == "__main__": 
-    trainloader, testloader = get_dataloaders('gsm8k')
+    trainloader, testloader = get_dataloaders('debate')
