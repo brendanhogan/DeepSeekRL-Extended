@@ -37,7 +37,7 @@ def eval_on_test_set(
     test_loader.reset()
     
     with open(log_file, 'w') as f:
-        total_debates = 0
+        total_comparisons = 0
         total_wins = 0
         
         for question in tqdm(test_loader, desc="Evaluating on test set"):
@@ -84,9 +84,9 @@ def eval_on_test_set(
                 is_test=True
             )
 
-            # Track total debates and wins
-            debates_this_question = len(completions_text)
-            total_debates += debates_this_question
+            # Track total comparisons and wins
+            comparisons_this_question = len(completions_text)
+            total_comparisons += comparisons_this_question
             total_wins += reward_metrics['num_wins']
 
             # For each completion pair, log the results
@@ -129,16 +129,16 @@ def eval_on_test_set(
                     f.write(f"{reward_name}: {reward_value:.4f}\n")
                 f.write(f"Total reward: {rewards_per_func[i].sum().item():.4f}\n")
 
-                # Log if trained model won this debate
+                # Log if trained model won this comparison
                 trained_model_won = rewards_per_func[i,0] > 0
-                f.write(f"\nOUTCOME: Trained model {'won' if trained_model_won else 'lost'} this debate\n")
+                f.write(f"\nOUTCOME: Trained model {'won' if trained_model_won else 'lost'} this comparison\n")
                 f.write("-"*40 + "\n")
 
             # Log summary metrics for this question
             f.write("\nSUMMARY METRICS:\n")
             f.write(f"Win rate: {reward_metrics['win_rate']:.2%}\n")
             f.write(f"Number of wins: {reward_metrics['num_wins']}\n")
-            f.write(f"Total debates: {reward_metrics['num_debates']}\n")
+            f.write(f"Total comparisons: {reward_metrics['num_comparisons']}\n")
             f.write(f"Average format scores:\n")
             f.write(f"  Strict format: {reward_metrics['rewards/strict_format']:.4f}\n")
             f.write(f"  Soft format: {reward_metrics['rewards/soft_format']:.4f}\n")
@@ -150,14 +150,14 @@ def eval_on_test_set(
                     total_scores[k] += v
         
         # Calculate final metrics
-        win_rate = (total_wins / total_debates) * 100 if total_debates > 0 else 0
+        win_rate = (total_wins / total_comparisons) * 100 if total_comparisons > 0 else 0
         avg_scores = {k: v/num_examples for k,v in total_scores.items()}
 
         # Save metrics
         metrics = {
             'win_rate': win_rate,
             'total_wins': total_wins,
-            'total_debates': total_debates,
+            'total_comparisons': total_comparisons,
             'num_examples': num_examples,
             'average_scores': avg_scores
         }
@@ -167,7 +167,7 @@ def eval_on_test_set(
         f.write("-" * 20 + "\n")
         f.write(f"Win Rate: {win_rate:.2f}%\n")
         f.write(f"Total Wins: {total_wins}\n") 
-        f.write(f"Total Debates: {total_debates}\n")
+        f.write(f"Total Comparisons: {total_comparisons}\n")
         f.write("\nAverage Scores:\n")
         for metric, value in avg_scores.items():
             f.write(f"{metric:15s}: {value:.4f}\n")
@@ -178,7 +178,7 @@ def eval_on_test_set(
             print("-" * 20)
             print(f"Win Rate: {win_rate:.2f}%")
             print(f"Total Wins: {total_wins}")
-            print(f"Total Debates: {total_debates}")
+            print(f"Total Comparisons: {total_comparisons}")
             print("\nAverage Scores:")
             for metric, value in avg_scores.items():
                 print(f"{metric:15s}: {value:.4f}")
@@ -469,8 +469,8 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name/path of base model")
     parser.add_argument("--judge_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name of model to use as judge")
     parser.add_argument("--compare_model_name", type=str, default="gpt-4o-mini", help="Name of model to use for comparison")
-    parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate"], help="Dataset to use for training")
-    parser.add_argument("--evaluator", type=str, default="debate", choices=["debate"], help="Evaluator to use for scoring")
+    parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate", "LD"], help="Dataset to use for training")
+    parser.add_argument("--evaluator", type=str, default="debate", choices=["debate", "LD"], help="Evaluator to use for scoring")
 
     # Output and logging
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")

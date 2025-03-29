@@ -192,12 +192,140 @@ def build_debate_dataloaders() -> Tuple[DebateDataLoader, DebateDataLoader]:
     
     return trainloader, testloader
 
+
+class LDDataLoader(DataLoader):
+    """
+    A loader class that provides iteration over subjects for Larry David-style roasts.
+    
+    This class implements both sequential and random access to roast subjects through
+    standard Python iterator protocols. For each subject, it generates a prompt for a
+    Larry David-style roast.
+    """
+    
+    def __init__(self, subjects: list[str], random: bool = False) -> None:
+        super().__init__(random)
+        self.subjects = subjects
+        self.pre_prompt = """You will be given a subject to roast in Larry David's style from Curb Your Enthusiasm. 
+            You should first reason about how to make it funny and creative, then provide your roast.
+            It is very important that you put your reasoning process inside <reasoning> tags and your actual roast inside <answer> tags, like this:
+
+            <reasoning>
+            Your step-by-step reasoning process here, thinking about what makes Larry David's humor unique and how to apply it to this subject
+            </reasoning>
+            <answer>
+            [Speak in first person as Larry David himself, using his signature style of complaining and social commentary. Your roast should sound like Larry is directly saying it, with his characteristic tone and mannerisms.]
+            </answer>
+
+            All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! Start each response by immediately starting with <reasoning>. 
+            """
+        self.system_prompt = SYSTEM_PROMPT
+            
+    def __len__(self) -> int:
+        return len(self.subjects)
+        
+    def __iter__(self) -> 'RoastDataLoader':
+        return self
+        
+    def __next__(self) -> str:
+        if self.current_index >= len(self.subjects):
+            raise StopIteration
+        
+        if self.random:
+            idx = random.randint(0, len(self.subjects) - 1)
+        else:
+            idx = self.current_index
+            self.current_index += 1
+            
+        subject = self.subjects[idx]
+        
+        # Format the question to include the subject
+        formatted_question = f"Roast Subject: {subject}"
+        
+        return formatted_question
+
+    def reset(self):
+        self.current_index = 0
+
+
+def build_ld_dataloaders() -> Tuple[LDDataLoader, LDDataLoader]:
+    # Define roast subjects - mix of celebrities, social norms, and everyday situations
+    subjects = [
+        "People who clap when planes land",
+        "Selfie sticks",
+        "People who talk in movie theaters",
+        "Social media influencers",
+        "People who wear pajamas to the airport",
+        "Reality TV shows",
+        "People who take phone calls on speaker in public",
+        "Food delivery apps",
+        "People who post their entire lives on social media",
+        "Modern art",
+        "People who use emojis in work emails",
+        "Smartphone addiction",
+        "People who take photos of their food",
+        "Online dating",
+        "People who wear masks while driving alone",
+        "Social media challenges",
+        "People who use voice messages",
+        "Modern architecture",
+        "People who clap at the end of movies",
+        "Food trucks",
+        "People who use hashtags in regular conversation",
+        "Modern music",
+        "People who take selfies at funerals",
+        "Social media filters",
+        "People who use speakerphone in restaurants",
+        "Modern fashion",
+        "People who post workout videos",
+        "Food delivery fees",
+        "People who use voice assistants in public",
+        "Modern technology",
+        "People who take photos of everything",
+        "Social media algorithms",
+        "People who use emojis in texts",
+        "Modern entertainment",
+        "People who post their entire lives",
+        "Food delivery services",
+        "People who use voice messages",
+        "Modern society",
+        "People who take photos of everything",
+        "Social media culture",
+        "People who use emojis in emails",
+        "Modern lifestyle",
+        "People who post their entire lives",
+        "Food delivery apps",
+        "People who use voice assistants",
+        "Modern culture",
+        "People who take photos of everything",
+        "Social media trends",
+        "People who use emojis in texts",
+        "Modern world"
+    ]
+    
+    # Split into train/test sets (85/15 split)
+    total_subjects = len(subjects)
+    test_size = int(total_subjects * 0.15)
+    
+    # Generate random indices for test set
+    test_indices = random.sample(range(total_subjects), test_size)
+    test_indices_set = set(test_indices)
+    
+    # Split subjects
+    train_subjects = [s for i, s in enumerate(subjects) if i not in test_indices_set]
+    test_subjects = [subjects[i] for i in test_indices]
+    
+    # Create data loaders
+    trainloader = LDDataLoader(train_subjects, random=True)
+    testloader = LDDataLoader(test_subjects, random=False)
+    
+    return trainloader, testloader
+
 def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     """
     Factory function to get train and test data loaders for a specified dataset.
     
     Args:
-        dataset_name (str): Name of the dataset to load ('gsm8k' or 'debate' currently supported)
+        dataset_name (str): Name of the dataset to load ('gsm8k', 'debate', or 'roast' currently supported)
         
     Returns:
         Tuple[DataLoader, DataLoader]: Train and test data loaders
@@ -207,8 +335,10 @@ def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     """
     if dataset_name.lower() == 'debate':
         return build_debate_dataloaders()
+    elif dataset_name.lower() == 'ld':
+        return build_ld_dataloaders()
     else:
-        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate' is available.")
+        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate' and 'roast' are available.")
 
 
 if __name__ == "__main__": 

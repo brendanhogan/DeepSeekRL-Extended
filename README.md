@@ -98,12 +98,17 @@ The debate framework demonstrates the effectiveness of GRPO training:
    - Results achieved with a different judge (GPT-4o) than training
    - Demonstrates robust improvement beyond reward hacking
 
+### Future Applications
+1. **Recipe Generation**: Training models to generate high-quality, detailed recipes
+2. **Comedy Writing**: Developing models that can write engaging and humorous content
+3. **Additional Debate Scenarios**: Expanding to more complex debate formats
 
 ## Future Directions
 1. Expand to more complex debate scenarios
 2. Implement multi-round debates
 3. Add support for more model types
 4. Improve reward structure and evaluation metrics
+5. Add panel of judges/multiobjective - generically - and setting of simulating populations 
 
 ## Citation
 If you use this framework in your research, please cite it as:
