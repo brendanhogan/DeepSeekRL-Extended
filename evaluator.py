@@ -344,29 +344,28 @@ class LDEvaluator(RewardEvaluator):
     
     def __init__(self):
         self.num_reward_functions = 4  # humor score + 3 format rewards
-        self.judge_prompt = """You are a comedy judge specializing in Larry David's style of humor. You will be shown two roasts/commentaries on the same subject. 
-        Your task is to determine which one is funnier based on:
-        1. Creativity and originality 
-        2. Larry David-style observational humor
-        3. Social commentary and relatability
+        self.judge_prompt = """You are a comedy judge. You will be shown two comedy bits in the style of Larry David making fun of something.
 
-        Important: Length does NOT equal quality. A shorter, punchier roast is often better than a longer one. Focus purely on how funny the content is, regardless of length.
-        
+        Your only job is to pick which one is funnier. Two critical rules:
+
+        1. Pick the funniest bit regardless of length or structure - a messy, extremely short bit could win if it's funnier
+        2. AUTOMATIC LOSS: If a bit doesn't speak in first person AS Larry David (e.g. if it says "this is what Larry David might say" or describes what he would say)
+
         Subject: {topic}
-        
-        Roast 1:
+
+        Bit 1:
         {arg1_response}
-        
-        Roast 2:
+
+        Bit 2:
         {arg2_response}
-        
-        Which roast was funnier? Respond with EXACTLY one of these options:
-        - ARGUMENT_1_WINS  
-        - ARGUMENT_2_WINS
+
+        Which bit was funnier? Respond with EXACTLY one of these options:
+        - BIT_1_WINS
+        - BIT_2_WINS
 
         YOU MUST CHOOSE A WINNER, A TIE IS NOT ALLOWED
-        Remember: Pick the funniest roast regardless of length - shorter can be better if it's funnier!
-        """
+        Remember: Any bit that doesn't speak AS Larry David in first person automatically loses. For bits that both speak as Larry, pick the funnier one regardless of length or structure."""
+
         
     def _extract_xml_answer(self, text: str) -> str:
         """Extract the answer portion from XML tags."""
@@ -441,10 +440,10 @@ class LDEvaluator(RewardEvaluator):
                     temperature=0.1
                 ).strip().upper()
                 
-                if "ARGUMENT_1_WINS" in judge_response:
+                if "BIT_1_WINS" in judge_response:
                     wins[i] += 1
                     losses[j] += 1
-                elif "ARGUMENT_2_WINS" in judge_response:
+                else:
                     wins[j] += 1
                     losses[i] += 1
 
@@ -535,7 +534,7 @@ class LDEvaluator(RewardEvaluator):
                 temperature=0.1
             ).strip().upper()
             
-            if "ARGUMENT_1_WINS" in judge_response:
+            if "BIT_1_WINS" in judge_response:
                 score = 1.0
                 rewards_per_func[i, 0] = score
                 wins += 1

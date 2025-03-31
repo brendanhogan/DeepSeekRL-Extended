@@ -205,15 +205,15 @@ class LDDataLoader(DataLoader):
     def __init__(self, subjects: list[str], random: bool = False) -> None:
         super().__init__(random)
         self.subjects = subjects
-        self.pre_prompt = """You will be given a subject to roast in Larry David's style from Curb Your Enthusiasm. 
-            You should first reason about how to make it funny and creative, then provide your roast.
+        self.pre_prompt = """You will be given a subject to mock in Larry David's style from Curb Your Enthusiasm. 
+            You should first reason about how to make it funny and creative, then provide your mocking.
             It is very important that you put your reasoning process inside <reasoning> tags and your actual roast inside <answer> tags, like this:
 
             <reasoning>
             Your step-by-step reasoning process here, thinking about what makes Larry David's humor unique and how to apply it to this subject
             </reasoning>
             <answer>
-            [Speak in first person as Larry David himself, using his signature style of complaining and social commentary. Your roast should sound like Larry is directly saying it, with his characteristic tone and mannerisms.]
+            [Speak in first person as Larry David himself]
             </answer>
 
             All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! Start each response by immediately starting with <reasoning>. 
@@ -223,7 +223,7 @@ class LDDataLoader(DataLoader):
     def __len__(self) -> int:
         return len(self.subjects)
         
-    def __iter__(self) -> 'RoastDataLoader':
+    def __iter__(self) -> 'LDDataLoader':
         return self
         
     def __next__(self) -> str:
