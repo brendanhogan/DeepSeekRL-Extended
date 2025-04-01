@@ -98,10 +98,17 @@ The debate framework demonstrates the effectiveness of GRPO training:
    - Results achieved with a different judge (GPT-4o) than training
    - Demonstrates robust improvement beyond reward hacking
 
-### Future Applications
-1. **Recipe Generation**: Training models to generate high-quality, detailed recipes
-2. **Comedy Writing**: Developing models that can write engaging and humorous content
-3. **Additional Debate Scenarios**: Expanding to more complex debate formats
+### Comedy Framework Results
+The comedy framework demonstrates GRPO's versatility in training models for creative tasks:
+
+![Comedy Training Progress](figures/comedy_win_rate.png)
+*Win rate of Qwen 2.5-7B vs GPT-4o-mini in Larry David-style comedy throughout training*
+
+1. **Base Model vs GPT-4o Performance**:
+   - Initial performance: 15% win rate
+   - Final performance: >90% win rate
+
+
 
 ## Future Directions
 1. Expand to more complex debate scenarios

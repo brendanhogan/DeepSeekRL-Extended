@@ -109,7 +109,7 @@ def plot_metrics(output_dir):
                 plt.plot(eval_steps, metric_values, color='#2ecc71', linewidth=2.0, label='Win Rate')
                 plt.xlabel('Training Steps', fontsize=12)
                 plt.ylabel('Win Rate (%)', fontsize=12)
-                plt.title('Comedy Test Set Debate Win Rate (Qwen 2.5-1.5B vs GPT-4)', fontsize=24, pad=20)
+                plt.title('Comedy Test Set Debate Win Rate (Qwen 2.5-7B vs GPT-4)', fontsize=24, pad=20)
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 pdf.savefig(bbox_inches='tight')
