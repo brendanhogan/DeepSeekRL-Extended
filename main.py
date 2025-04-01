@@ -601,7 +601,7 @@ if __name__ == "__main__":
     for round_num in tqdm(range(start_round, args.num_train_iters), desc="Training Progress"):
         print(f"Round {round_num}")
         # Evaluate on test set every so often 
-        if False:#round_num % args.eval_iterations == 0:
+        if round_num % args.eval_iterations == 0:
             eval_metrics, eval_accuracy = eval_on_test_set(
                 all_models=all_models,
                 test_loader=test_loader,
