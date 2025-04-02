@@ -109,6 +109,14 @@ The comedy framework demonstrates GRPO's versatility in training models for crea
    - Final performance: >90% win rate
 
 
+### Chopped/Recipes Framework Results
+
+![Chopped Training Progress](figures/chopped_win_rate.png)
+*Win rate of Qwen 2.5-7B vs GPT-4o-mini in Chopped Style Recipe Generation*
+
+1. **Base Model vs GPT-4o Performance**:
+   - Initial performance: 56% win rate
+   - Final performance: >86% win rate
 
 ## Future Directions
 1. Expand to more complex debate scenarios
