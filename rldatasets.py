@@ -320,12 +320,147 @@ def build_ld_dataloaders() -> Tuple[LDDataLoader, LDDataLoader]:
     
     return trainloader, testloader
 
+
+class ChoppedDataLoader(DataLoader):
+    """
+    A loader class that provides iteration over mystery baskets for Chopped-style recipe generation.
+    
+    This class implements both sequential and random access to mystery baskets through
+    standard Python iterator protocols. For each basket, it generates a prompt for creating
+    a creative recipe using all the mystery ingredients.
+    """
+    
+    def __init__(self, baskets: list[list[str]], random: bool = False) -> None:
+        super().__init__(random)
+        self.baskets = baskets
+        self.pre_prompt = """You will be given 4 mystery ingredients from a Chopped-style cooking show. 
+            You should first reason about how to create the best possible dish using these ingredients,
+            then provide a detailed recipe. It is very important that you put your reasoning process inside 
+            <reasoning> tags and your recipe inside <answer> tags, like this:
+
+            <reasoning>
+            Your step-by-step reasoning process here, thinking about:
+            1. How to balance flavors and textures
+            2. Cooking techniques that would work best
+            3. How to make the dish cohesive despite unusual combinations
+            4. Additional ingredients needed and why
+            5. Timing and execution strategy
+            </reasoning>
+            <answer>
+            A detailed recipe that:
+            - Uses all mystery ingredients
+            - Can be made in 40 minutes
+            - Includes a list of additional ingredients needed
+            - Has clear step-by-step instructions
+            - Includes timing estimates
+            </answer>
+
+            All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! 
+            Start each response by immediately starting with <reasoning>. 
+            """
+        self.system_prompt = SYSTEM_PROMPT
+            
+    def __len__(self) -> int:
+        return len(self.baskets)
+        
+    def __iter__(self) -> 'ChoppedDataLoader':
+        return self
+        
+    def __next__(self) -> str:
+        if self.current_index >= len(self.baskets):
+            raise StopIteration
+        
+        if self.random:
+            idx = random.randint(0, len(self.baskets) - 1)
+        else:
+            idx = self.current_index
+            self.current_index += 1
+            
+        basket = self.baskets[idx]
+        
+        # Format the question to include the mystery basket
+        formatted_question = f"Mystery Basket:\n" + "\n".join(f"- {ingredient}" for ingredient in basket)
+        
+        return formatted_question
+
+    def reset(self):
+        self.current_index = 0
+
+
+def build_chopped_dataloaders() -> Tuple[ChoppedDataLoader, ChoppedDataLoader]:
+    # Define base ingredients for training - mix of common and unusual ingredients
+    train_ingredients = [
+        "Gummy bears",
+        "Sardines",
+        "Popcorn",
+        "Hot sauce",
+        "Marshmallows",
+        "Kimchi",
+        "Coffee grounds",
+        "Coconut water",
+        "Bacon",
+        "Blue cheese",
+        "Ginger root",
+        "Lemon grass",
+        "Mint leaves",
+        "Pomegranate seeds",
+        "Soy sauce",
+        "Tofu",
+        "Wasabi",
+        "Yogurt",
+        "Zucchini",
+        "Quinoa"
+    ]
+    
+    # Define separate ingredients for testing
+    test_ingredients = [
+        "Durian",
+        "Seaweed",
+        "Crickets",
+        "Black garlic",
+        "Goat cheese",
+        "Mango",
+        "Curry powder",
+        "Pickled ginger",
+        "Coconut milk",
+        "Tempeh",
+        "Star anise",
+        "Lime leaves",
+        "Cilantro",
+        "Pomegranate molasses",
+        "Fish sauce",
+        "Miso paste",
+        "Sesame oil",
+        "Kombu",
+        "Shiitake mushrooms",
+        "Rice vinegar"
+    ]
+    
+    # Generate training baskets (80 baskets)
+    train_baskets = []
+    for _ in range(80):
+        basket = random.sample(train_ingredients, 4)
+        train_baskets.append(basket)
+    
+    # Generate test baskets (20 baskets)
+    test_baskets = []
+    for _ in range(10):
+        basket = random.sample(test_ingredients, 4)
+        test_baskets.append(basket)
+    
+    # Create data loaders
+    trainloader = ChoppedDataLoader(train_baskets, random=True)
+    testloader = ChoppedDataLoader(test_baskets, random=False)
+    
+    return trainloader, testloader
+
+
 def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     """
     Factory function to get train and test data loaders for a specified dataset.
     
     Args:
-        dataset_name (str): Name of the dataset to load ('gsm8k', 'debate', or 'roast' currently supported)
+        dataset_name (str): Name of the dataset to load ('gsm8k', 'debate', 'ld', or 'chopped' currently supported)
         
     Returns:
         Tuple[DataLoader, DataLoader]: Train and test data loaders
@@ -337,8 +472,10 @@ def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
         return build_debate_dataloaders()
     elif dataset_name.lower() == 'ld':
         return build_ld_dataloaders()
+    elif dataset_name.lower() == 'chopped':
+        return build_chopped_dataloaders()
     else:
-        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate' and 'roast' are available.")
+        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate', 'ld', and 'chopped' are available.")
 
 
 if __name__ == "__main__": 

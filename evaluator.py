@@ -83,6 +83,8 @@ def get_evaluator(name: str) -> RewardEvaluator:
         return DebateEvaluator()
     elif name.lower() == "ld":
         return LDEvaluator()
+    elif name.lower() == "chopped":
+        return ChoppedEvaluator()
     else:
         raise NotImplementedError(f"No evaluator implemented for {name}")
 
@@ -576,6 +578,255 @@ class LDEvaluator(RewardEvaluator):
         """Convert raw reward scores to a labeled dictionary."""
         return {
             "humor_score": rewards[0].item(),
+            "strict_format": rewards[1].item(),
+            "soft_format": rewards[2].item(),
+            "xml_count": rewards[3].item()
+        }
+
+
+class ChoppedEvaluator(RewardEvaluator):
+    """
+    Reward evaluator for Chopped-style recipe generation using two different approaches:
+    1. For training: round-robin tournament scoring between generated recipes
+    2. For testing: head-to-head comparisons against the base model
+    """
+    
+    def __init__(self):
+        self.num_reward_functions = 4  # recipe score + 3 format rewards
+        self.judge_prompt = """You are a Chopped judge evaluating two recipes that use the same mystery basket ingredients.
+        Your task is to determine which recipe would taste better based on:
+        1. Flavor balance and harmony
+        2. Creative use of mystery ingredients
+        3. Technical execution and timing
+        4. Overall appeal and presentation
+        5. Practicality and replicability
+
+        Mystery Basket:
+        {basket}
+
+        Recipe 1:
+        {recipe1}
+
+        Recipe 2:
+        {recipe2}
+
+        Which recipe would taste better? Respond with EXACTLY one of these options:
+        - RECIPE_1_WINS
+        - RECIPE_2_WINS
+
+        YOU MUST CHOOSE A WINNER, A TIE IS NOT ALLOWED
+        Focus purely on which recipe would taste better and make better use of the mystery ingredients.
+        """
+        
+    def _extract_xml_answer(self, text: str) -> str:
+        """Extract the answer portion from XML tags."""
+        try:
+            answer = text.split("<answer>")[-1]
+            answer = answer.split("</answer>")[0]
+            return answer.strip()
+        except:
+            return text  # Fallback if format is incorrect
+   
+    def _strict_format_reward(self, completions) -> List[float]:
+        """Reward for strict XML format."""
+        pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+        matches = [bool(re.match(pattern, r)) for r in completions]
+        return [0.5 if m else 0.0 for m in matches]
+
+    def _soft_format_reward(self, completions) -> List[float]:
+        """Reward for relaxed XML format."""
+        pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+        matches = [bool(re.match(pattern, r)) for r in completions]
+        return [0.5 if m else 0.0 for m in matches]
+
+    def _xml_count_reward(self, completions) -> List[float]:
+        """Reward for XML tag counting."""
+        def count_xml(text: str) -> float:
+            count = 0.0
+            if "<reasoning>" in text: count += 0.125
+            if "</reasoning>" in text: count += 0.125
+            if "<answer>" in text: count += 0.125
+            if "</answer>" in text: count += 0.125
+            
+            # Only penalize actual content after final tag
+            if "</answer>" in text:
+                count -= len(text.split("</answer>")[-1].strip())*0.001
+            return count
+            
+        return [count_xml(r) for r in completions]
+        
+    def _compute_train_rewards(
+        self,
+        input_prompt: str,
+        all_models: Dict[str, Any],
+        train_model_completions: List[str],
+        device: str
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Round-robin tournament scoring for training + format rewards."""
+        num_completions = len(train_model_completions)
+        rewards_per_func = torch.zeros(num_completions, self.num_reward_functions, device=device)
+        
+        # Track wins/losses for each completion
+        wins = torch.zeros(num_completions, device=device)
+        losses = torch.zeros(num_completions, device=device)
+        
+        # Get recipe scores using round-robin tournament
+        for i in tqdm(range(num_completions), desc="Evaluating completions", leave=False):
+            for j in range(i + 1, num_completions):
+                basket = input_prompt.split("Mystery Basket:\n")[1].strip()
+                recipe1 = self._extract_xml_answer(train_model_completions[i])
+                recipe2 = self._extract_xml_answer(train_model_completions[j])
+                
+                judge_prompt = self.judge_prompt.format(
+                    basket=basket,
+                    recipe1=recipe1,
+                    recipe2=recipe2
+                )
+                
+                # Get judge's decision using the interface
+                judge_response = all_models["judge_model"].generate(
+                    system_prompt="You are a Chopped judge evaluating recipes.",
+                    user_prompt=judge_prompt,
+                    max_new_tokens=50,
+                    temperature=0.1
+                ).strip().upper()
+                
+                if "RECIPE_1_WINS" in judge_response:
+                    wins[i] += 1
+                    losses[j] += 1
+                else:
+                    wins[j] += 1
+                    losses[i] += 1
+
+        # Calculate normalized scores (-1.5 to 1.5 range)
+        total_matches = num_completions - 1
+        win_rate = wins / total_matches
+        loss_rate = losses / total_matches
+        recipe_scores = (win_rate - loss_rate) * 1.5  # Scale to desired range
+
+        # Get format rewards
+        strict_format = torch.tensor(
+            self._strict_format_reward(train_model_completions), 
+            device=device
+        )
+        soft_format = torch.tensor(
+            self._soft_format_reward(train_model_completions), 
+            device=device
+        )
+        xml_count = torch.tensor(
+            self._xml_count_reward(train_model_completions), 
+            device=device
+        )
+        
+        # Combine all rewards
+        rewards_per_func[:, 0] = recipe_scores
+        rewards_per_func[:, 1] = strict_format
+        rewards_per_func[:, 2] = soft_format
+        rewards_per_func[:, 3] = xml_count
+        
+        metrics = {
+            "rewards/recipe_score": recipe_scores.mean().item(),
+            "rewards/strict_format": strict_format.mean().item(),
+            "rewards/soft_format": soft_format.mean().item(),
+            "rewards/xml_count": xml_count.mean().item(),
+            "reward": rewards_per_func.sum(dim=1).mean().item()
+        }
+        
+        return rewards_per_func, metrics
+
+    def _compute_test_rewards(
+        self,
+        prompt: str,
+        all_models: Dict[str, Any],
+        train_model_completions: List[str],
+        compare_model_completions: List[str],
+        device: str
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Head-to-head comparisons against base model for testing."""
+        num_comparisons = len(train_model_completions)
+        rewards_per_func = torch.zeros(num_comparisons, self.num_reward_functions, device=device)
+        wins = 0
+        
+        # Get format rewards
+        strict_format = torch.tensor(
+            self._strict_format_reward(train_model_completions), 
+            device=device
+        )
+        soft_format = torch.tensor(
+            self._soft_format_reward(train_model_completions), 
+            device=device
+        )
+        xml_count = torch.tensor(
+            self._xml_count_reward(train_model_completions), 
+            device=device
+        )
+        
+        basket = prompt.split("Mystery Basket:\n")[1].strip()
+        
+        for i in range(num_comparisons):
+            # Get trained model's response
+            trained_response = self._extract_xml_answer(train_model_completions[i])
+            
+            # Get compare model's response
+            compare_response = self._extract_xml_answer(compare_model_completions[i])     
+
+            # Format judge prompt
+            judge_prompt = self.judge_prompt.format(
+                basket=basket,
+                recipe1=trained_response,
+                recipe2=compare_response
+            )
+            
+            # Get judge's decision using the interface
+            judge_response = all_models["judge_model"].generate(
+                system_prompt="You are a Chopped judge evaluating recipes.",
+                user_prompt=judge_prompt,
+                max_new_tokens=50,
+                temperature=0.1
+            ).strip().upper()
+            
+            if "RECIPE_1_WINS" in judge_response:
+                score = 1.0
+                rewards_per_func[i, 0] = score
+                wins += 1
+
+            # Add format rewards
+            rewards_per_func[i, 1] = strict_format[i]
+            rewards_per_func[i, 2] = soft_format[i]
+            rewards_per_func[i, 3] = xml_count[i]
+
+        win_rate = wins / num_comparisons
+        metrics = {
+            "win_rate": win_rate,
+            "reward": rewards_per_func.mean().item(),
+            "num_wins": wins,
+            "num_comparisons": num_comparisons,
+            "rewards/strict_format": strict_format.mean().item(),
+            "rewards/soft_format": soft_format.mean().item(), 
+            "rewards/xml_count": xml_count.mean().item()
+        }
+        
+        return rewards_per_func, metrics
+
+    def compute_rewards(
+        self,
+        input_prompt: str,
+        all_models: Dict[str, Any],
+        train_model_completions: List[str],
+        compare_model_completions: Optional[List[str]] = None,
+        device: str = "cuda",
+        is_test: bool = False
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute rewards - different behavior for training vs testing."""
+        if is_test:
+            return self._compute_test_rewards(input_prompt, all_models, train_model_completions, compare_model_completions, device)
+        else:
+            return self._compute_train_rewards(input_prompt, all_models, train_model_completions, device)
+            
+    def get_reward_breakdown(self, rewards: torch.Tensor) -> Dict[str, float]:
+        """Convert raw reward scores to a labeled dictionary."""
+        return {
+            "recipe_score": rewards[0].item(),
             "strict_format": rewards[1].item(),
             "soft_format": rewards[2].item(),
             "xml_count": rewards[3].item()
