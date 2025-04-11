@@ -183,11 +183,16 @@ def plot_metrics(output_dir):
                 plt.plot(eval_steps, accuracy_values, color='#2ecc71', linewidth=2.0, marker='o', label='Accuracy')
                 plt.xlabel('Evaluation Round', fontsize=12) # Changed label
                 plt.ylabel('Accuracy (%)', fontsize=12)
-                plt.title('Evaluation Accuracy', fontsize=14, pad=20)
+                plt.title('Qwen 2.5 VL Oxford Flowers 102 Evaluation Accuracy', fontsize=14, pad=20)
                 plt.grid(True, alpha=0.3)
                 plt.xticks(eval_steps) # Ensure ticks match evaluation rounds
+                plt.tick_params(axis='x', labelsize=8) # Decrease x-axis label size
                 plt.legend()
                 pdf.savefig(bbox_inches='tight')
+                # Save as separate PNG file
+                png_path = os.path.join(output_dir, 'evaluation_accuracy.png')
+                plt.savefig(png_path, bbox_inches='tight')
+                print(f"Evaluation accuracy plot saved to {png_path}")
                 plt.close()
             else:
                 print("Warning: 'overall_accuracy_percent' key missing in some evaluation logs. Skipping accuracy plot.")
