@@ -9,11 +9,16 @@ from tqdm import tqdm
 from collections import defaultdict
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
 from model_interface import ModelInterface
+from typing import Optional, List, Dict, Any
 
 import llms
 import utils
 import evaluator
 import rldatasets
+import plotter
+
+# Added for detailed log saving
+import datetime 
 
 def eval_on_test_set(
     all_models: dict,
@@ -22,25 +27,28 @@ def eval_on_test_set(
     device: str,
     args: argparse.Namespace,
     round_num: int
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, Optional[List[Dict[str, Any]]]]:
     """
     Evaluate model performance on test set by comparing each model completion
     against a base model completion and having them judged.
+    Returns metrics, win rate, and detailed logs.
     """
     print("Running evaluation on test set...")
     
     total_scores = defaultdict(float)
     num_examples = 0
     total_wins = 0
+    all_detailed_logs = [] # Store logs from all examples
 
-    log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
+    # File for human-readable logs
+    log_file = os.path.join(args.output_dir, f'eval_log_readable_{round_num}.txt')
     test_loader.reset()
     
     with open(log_file, 'w') as f:
         total_comparisons = 0
         total_wins = 0
         
-        for question in tqdm(test_loader, desc="Evaluating on test set"):
+        for example_idx, question in enumerate(tqdm(test_loader, desc="Evaluating on test set")):
             num_examples += 1
 
             # 1. Prepare prompting
@@ -56,7 +64,7 @@ def eval_on_test_set(
             f.write("="*80 + "\n\n")
             
             f.write("Prompt:\n")
-            f.write(f"{prompt_text}\n\n")
+            f.write(f"{question}\n\n") # Log the original question, not the templated one
 
             # Generate completions from trained model
             _, _, _, _, completions_text, _ = generate_completions(
@@ -74,15 +82,24 @@ def eval_on_test_set(
                 )
                 compare_completions_text.append(completion)
 
-            # Score completions to get reward metrics
-            rewards_per_func, reward_metrics = eval_class.compute_rewards(
+            # Score completions to get reward metrics and detailed logs
+            rewards_per_func, reward_metrics, detailed_logs_this_q = eval_class.compute_rewards(
                 input_prompt=question, 
                 all_models=all_models, 
                 train_model_completions=completions_text, 
                 compare_model_completions=compare_completions_text,
+                num_principles=args.num_principles,             # Pass GRM args
+                num_inference_rounds=args.number_of_inference_rounds, # Pass GRM args
                 device=device,
                 is_test=True
             )
+
+            # Store detailed logs if available
+            if detailed_logs_this_q:
+                # Add example index to each log entry for context
+                for log_entry in detailed_logs_this_q:
+                    log_entry["example_index"] = example_idx
+                all_detailed_logs.extend(detailed_logs_this_q)
 
             # Track total comparisons and wins
             comparisons_this_question = len(completions_text)
@@ -129,16 +146,32 @@ def eval_on_test_set(
                     f.write(f"{reward_name}: {reward_value:.4f}\n")
                 f.write(f"Total reward: {rewards_per_func[i].sum().item():.4f}\n")
 
-                # Log if trained model won this comparison
-                trained_model_won = rewards_per_func[i,0] > 0
-                f.write(f"\nOUTCOME: Trained model {'won' if trained_model_won else 'lost'} this comparison\n")
+                # Log GRM details if available (find the corresponding log entry)
+                comparison_log = next((log for log in detailed_logs_this_q if log['comparison_index'] == i), None)
+                if comparison_log:
+                    f.write("\nGRM EVALUATION DETAILS:\n")
+                    f.write(f"Overall Winner: {comparison_log['overall_winner']}\n")
+                    for round_detail in comparison_log.get('rounds', []):
+                        f.write(f"  Round {round_detail['round']}:\n")
+                        if "error" in round_detail:
+                            f.write(f"    Error: {round_detail['error']}\n")
+                            continue
+                        f.write(f"    Principles: {json.dumps(round_detail.get('principles', []))}\n")
+                        f.write(f"    Arg1 Critique: {round_detail.get('arg1_critique', 'N/A')} (Score: {round_detail.get('arg1_score', 'N/A')})\n")
+                        f.write(f"    Arg2 Critique: {round_detail.get('arg2_critique', 'N/A')} (Score: {round_detail.get('arg2_score', 'N/A')})\n")
+                        f.write(f"    Round Winner: {round_detail.get('round_winner', 'N/A')}\n")
+                else:
+                    # Fallback for older logging or if logs weren't generated
+                    trained_model_won = rewards_per_func[i, 0] > 0 # debate_score is index 0
+                    f.write(f"\nOUTCOME (Fallback): Trained model {'won' if trained_model_won else 'lost'} this comparison\n")
+
                 f.write("-"*40 + "\n")
 
             # Log summary metrics for this question
             f.write("\nSUMMARY METRICS:\n")
             f.write(f"Win rate: {reward_metrics['win_rate']:.2%}\n")
             f.write(f"Number of wins: {reward_metrics['num_wins']}\n")
-            f.write(f"Total comparisons: {reward_metrics['num_comparisons']}\n")
+            # f.write(f"Total comparisons: {reward_metrics['num_comparisons']}\n")
             f.write(f"Average format scores:\n")
             f.write(f"  Strict format: {reward_metrics['rewards/strict_format']:.4f}\n")
             f.write(f"  Soft format: {reward_metrics['rewards/soft_format']:.4f}\n")
@@ -148,7 +181,7 @@ def eval_on_test_set(
             for k, v in reward_metrics.items():
                 if k.startswith('rewards/'):
                     total_scores[k] += v
-        
+
         # Calculate final metrics
         win_rate = (total_wins / total_comparisons) * 100 if total_comparisons > 0 else 0
         avg_scores = {k: v/num_examples for k,v in total_scores.items()}
@@ -188,7 +221,7 @@ def eval_on_test_set(
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=4)
 
-    return metrics, win_rate
+    return metrics, win_rate, all_detailed_logs
 
 def generate_completions(
     model: PreTrainedModel,
@@ -301,15 +334,18 @@ def score_completions(
 
     # Format inputs as expected by evaluator
     # Get rewards and metrics from evaluator
-    rewards_per_func, metrics = eval_class.compute_rewards(
+    rewards_per_func, metrics, _ = eval_class.compute_rewards(
         input_prompt=question,
         all_models=all_models, 
         train_model_completions=completions_text, 
         compare_model_completions=None,
+        num_principles=args.num_principles,
+        num_inference_rounds=args.number_of_inference_rounds,
         device=device, 
         is_test=False
     )
     rewards = rewards_per_func.sum(dim=1)
+
 
 
     # Store generation data
@@ -426,7 +462,7 @@ def grpo_loss(
         args: Training arguments
         
     Returns:
-        loss: The computed GRPO loss
+        loss: The computed GRPO loss per step (before accumulation)
         metrics: Dictionary containing training metrics
         reward: The total reward for this batch
     """
@@ -466,8 +502,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
     
     # Model configuration
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name/path of base model")
-    parser.add_argument("--judge_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name of model to use as judge")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="Name/path of base model")
+    parser.add_argument("--judge_model_name", type=str, default="gpt-4o-mini", help="Name of model to use as judge")
     parser.add_argument("--compare_model_name", type=str, default="gpt-4o-mini", help="Name of model to use for comparison")
     parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate", "ld", "chopped"], help="Dataset to use for training")
     parser.add_argument("--evaluator", type=str, default="debate", choices=["debate", "ld", "chopped"], help="Evaluator to use for scoring")
@@ -494,7 +530,7 @@ def parse_args():
 
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature")
-    parser.add_argument("--num_chains", type=int, default=16, help="Number of parallel generation chains")
+    parser.add_argument("--num_chains", type=int, default=4, help="Number of parallel generation chains")
     parser.add_argument("--max_prompt_length", type=int, default=256, help="Maximum prompt length")
     parser.add_argument("--max_completion_length", type=int, default=786, help="Maximum completion length")
 
@@ -502,6 +538,10 @@ def parse_args():
     parser.add_argument("--num_train_iters", type=int, default=1000, help="Number of training iterations")
     parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
     parser.add_argument("--seed", type=int, default=7111994, help="Random seed")
+
+    # GRM Evaluation Parameters (added)
+    parser.add_argument("--number_of_inference_rounds", type=int, default=3, help="Number of GRM evaluation rounds per comparison")
+    parser.add_argument("--num_principles", type=int, default=3, help="Number of principles to generate per GRM round")
 
     args = parser.parse_args()
     return args
@@ -524,7 +564,7 @@ if __name__ == "__main__":
     base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
 
     # Get judge and compare models using the new interfaces
-    judge_model = llms.get_judge_model(args.judge_model_name, device)
+    judge_model = llms.get_judge_model(args.judge_model_name, "cuda:1")
     compare_model = llms.get_compare_model(args.compare_model_name, device)
     
     # Simplified all_models dictionary
@@ -598,11 +638,16 @@ if __name__ == "__main__":
     accumulated_loss = 0
     optimizer.zero_grad()
 
+    # Store eval results over time
+    evaluation_results = {}
+
     for round_num in tqdm(range(start_round, args.num_train_iters), desc="Training Progress"):
-        print(f"Round {round_num}")
+        if args.verbose: print(f"Starting Round {round_num}")
+        
         # Evaluate on test set every so often 
         if round_num % args.eval_iterations == 0:
-            eval_metrics, eval_accuracy = eval_on_test_set(
+            if args.verbose: print(f"Running evaluation at round {round_num}...")
+            eval_metrics, eval_win_rate, detailed_eval_logs = eval_on_test_set(
                 all_models=all_models,
                 test_loader=test_loader,
                 eval_class=eval_class,
@@ -610,15 +655,32 @@ if __name__ == "__main__":
                 args=args,
                 round_num=round_num
             )
-
             
-            # Save metrics to eval log dir
-            metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
-            with open(metrics_path, 'w') as f:
+            # Save detailed logs to a separate JSON file
+            detailed_log_path = os.path.join(eval_log_dir, f'detailed_eval_log_{round_num}.json')
+            with open(detailed_log_path, 'w') as f_log:
+                json.dump(detailed_eval_logs, f_log, indent=2)
+            
+            # Save summary metrics to eval log dir
+            metrics_path = os.path.join(eval_log_dir, f'summary_metrics_{round_num}.json')
+            pdf_output_path = os.path.join(eval_log_dir, f'evaluation_report_{round_num}.pdf') # PDF path
+            with open(metrics_path, 'w') as f_metrics:
                 json.dump({
-                    'metrics': eval_metrics,
-                    'accuracy': eval_accuracy
-                }, f, indent=4)
+                    'round': round_num,
+                    'win_rate': eval_win_rate,
+                    'metrics': eval_metrics
+                }, f_metrics, indent=4)
+            evaluation_results[round_num] = {'win_rate': eval_win_rate, 'metrics': eval_metrics}
+
+            # Generate PDF report
+            utils.create_evaluation_pdf(
+                detailed_log_path=detailed_log_path,
+                summary_metrics_path=metrics_path,
+                win_rate_plot_path=os.path.join(args.output_dir, 'eval_win_rate.png'), # Pass plot path
+                output_pdf_path=pdf_output_path
+            )
+
+            if args.verbose: print(f"Evaluation complete for round {round_num}. Win rate: {eval_win_rate:.2f}%")
 
         # Save checkpoint
         if (round_num + 1) % args.save_steps == 0:
@@ -642,22 +704,26 @@ if __name__ == "__main__":
 
         # Do GRPO - generate chains, score, compute advantage, compute loss 
         total_loss, train_metrics = grpo_loss(train_loader, all_models, question, eval_class, device, round_num, train_log_dir, args)
-        
-        # Gradient accumulation
-        total_loss = total_loss
-        total_loss.backward()
-        accumulated_loss += total_loss.item()
-        scheduler.step()
+        print(f"Total loss: {total_loss}")
+
+        # Normalize loss by accumulation steps
+        loss_for_step = total_loss / args.gradient_accumulation_steps
+        loss_for_step.backward()
+        accumulated_loss += loss_for_step.item() # Log the normalized loss
 
         # Step optimizer
         if (round_num + 1) % args.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
-            optimizer.zero_grad()    
+            optimizer.zero_grad()
+            scheduler.step() # Step scheduler here
+            if args.verbose: print(f"Optimizer step at round {round_num}. Accumulated Loss: {accumulated_loss:.4f}")
+            accumulated_loss = 0 # Reset accumulated loss
 
         # Logs
         train_metrics["learning_rate"] = scheduler.get_last_lr()[0]
-        train_metrics["loss"] = total_loss.item() * args.gradient_accumulation_steps
+        train_metrics["loss"] = loss_for_step.item() # Log the loss for this step
+        train_metrics["accumulated_loss_before_step"] = accumulated_loss if (round_num + 1) % args.gradient_accumulation_steps != 0 else train_metrics["loss"] # approx
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
         train_metrics["grad_norm"] = grad_norm
         train_metrics_total[round_num] = train_metrics
@@ -666,4 +732,36 @@ if __name__ == "__main__":
 
         # Add after each major operation in the training loop
         torch.cuda.empty_cache()
-    
+        print("1 train step complete")
+
+    # Generate final plots after training finishes
+    print("\nGenerating final training plots...")
+    try:
+        plotter.plot_metrics(args.output_dir)
+    except Exception as e:
+        print(f"Error generating final plots: {e}")
+
+    # Final evaluation after training completes
+    print("\nTraining finished. Running final evaluation...")
+    final_eval_metrics, final_eval_win_rate, final_detailed_eval_logs = eval_on_test_set(
+        all_models=all_models,
+        test_loader=test_loader,
+        eval_class=eval_class,
+        device=device,
+        args=args,
+        round_num=args.num_train_iters - 1
+    )
+
+    # Generate final PDF report
+    if final_detailed_eval_logs: # Only generate if logs exist
+         try:
+            final_win_rate_plot_path = os.path.join(args.output_dir, 'eval_win_rate.png')
+            utils.create_evaluation_pdf(
+                detailed_log_path=os.path.join(eval_log_dir, f'detailed_eval_log_{args.num_train_iters - 1}.json'),
+                summary_metrics_path=os.path.join(eval_log_dir, f'summary_metrics_{args.num_train_iters - 1}.json'),
+                win_rate_plot_path=final_win_rate_plot_path if os.path.exists(final_win_rate_plot_path) else None, # Pass plot path if it exists
+                output_pdf_path=os.path.join(eval_log_dir, f'evaluation_report_{args.num_train_iters - 1}.pdf')
+            )
+         except Exception as e:
+             print(f"Error calling PDF generation for final report: {e}")
+

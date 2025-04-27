@@ -37,6 +37,7 @@ def get_llm_tokenizer(model_name: str, device: str) -> tuple[PreTrainedModel, Pr
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False
     
     return model, tokenizer
 

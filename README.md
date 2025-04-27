@@ -79,7 +79,6 @@ Final debate position
 </answer>
 ```
 
-## Results
 
 ### Debate Framework Results
 The debate framework demonstrates the effectiveness of GRPO training:
@@ -118,12 +117,16 @@ The comedy framework demonstrates GRPO's versatility in training models for crea
    - Initial performance: 56% win rate
    - Final performance: >86% win rate
 
-## Future Directions
-1. Expand to more complex debate scenarios
-2. Implement multi-round debates
-3. Add support for more model types
-4. Improve reward structure and evaluation metrics
-5. Add panel of judges/multiobjective - generically - and setting of simulating populations 
+
+
+####  New GRM-Inspired Debate Evaluation
+Following [DeepSeek's new paper](https://arxiv.org/abs/2504.02495) - for the `debate` task, the evaluation (both during training round-robin and test head-to-head) uses a multi-step approach inspired by Generative Reward Modeling (GRM) to provide more nuanced scoring:
+1.  **Principle Generation**: Given the debate topic and two arguments, the judge model is first asked to generate a set of `num_principles` evaluation principles tailored to the specific arguments.
+2.  **Critique & Score Generation**: For each argument, the judge model is then called again. It receives the argument and the generated principles, and provides a critique and a score (1-10) *for each principle* based on how well the argument adheres to it. The output is structured JSON.
+3.  **Aggregation & Winner Determination**: The per-principle scores for an argument are aggregated (e.g., summed). The argument with the higher aggregate score wins the comparison for that round.
+4.  **Multi-Round Evaluation**: This whole process (Steps 1-3) can be repeated multiple times (`number_of_inference_rounds`) for the same argument pair. The final winner is determined by which argument won more rounds.
+
+Still lots to do here, making just this part of the implementatio more general, adding the rest of the parts of the paper, trying out some alignment ideas that do not require a ground truth dataset etc.
 
 ## Citation
 If you use this framework in your research, please cite it as:

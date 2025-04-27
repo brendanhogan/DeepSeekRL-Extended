@@ -7,4 +7,6 @@
 # python main.py --output_dir "chopped_gpt4o_mini_gpt_judge_Qwen2.5-7B" --verbose --dataset_name "chopped" --evaluator "chopped" --judge_model_name gpt-4o-mini --model_name Qwen/Qwen2.5-7B-Instruct --resume
 # python main.py --output_dir "chopped_gpt4o_mini_gpt_judge_Qwen2.5-1B" --verbose --dataset_name "chopped" --evaluator "chopped"
 # python plotter.py --log_dir "ld_gpt4o_mini_gpt_judge_llama_8b"
-python plotter.py --log_dir "chopped_gpt4o_mini_gpt_judge_Qwen2.5-7B"
+# python plotter.py --log_dir "chopped_gpt4o_mini_gpt_judge_Qwen2.5-7B"
+# python main.py --output_dir "grm_test" --verbose
+python plotter.py --log_dir "grm_test"
