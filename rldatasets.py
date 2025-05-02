@@ -8,7 +8,7 @@ import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset, Dataset
 from abc import ABC, abstractmethod
-from typing import Tuple, Any
+from typing import Tuple, Any, List
 
 
 
@@ -455,6 +455,147 @@ def build_chopped_dataloaders() -> Tuple[ChoppedDataLoader, ChoppedDataLoader]:
     return trainloader, testloader
 
 
+
+# --- SVG DataLoader Implementation ---
+
+class SVGDataLoader(DataLoader):
+    """
+    A loader class that provides iteration over SVG scene descriptions.
+
+    This class implements sequential and random access to scene descriptions.
+    It stores the prompt structure expected by the SVG generation model.
+    """
+
+    def __init__(self, scenes: List[str], random: bool = False) -> None:
+        super().__init__(random)
+        self.scenes = scenes
+        # Adapted pre_prompt for SVG generation task
+        self.pre_prompt = """You are an expert SVG generator. You will be given a description of a scene. Generate the highest quality SVG code possible for the given scene.
+It is very important that you put your reasoning process inside <reasoning> tags and your final SVG code inside <answer> tags, like this:
+
+<reasoning>
+Your step-by-step reasoning process here for the SVG design (e.g., elements, colors, layout).
+</reasoning>
+<answer>
+The complete SVG code, starting with <svg> and ending with </svg>. Ensure it is valid SVG.
+</answer>
+
+All of your returned text should either be in the <reasoning> or <answer> tags - no text outside! Start each response immediately with <reasoning>.
+"""
+        # Assuming SYSTEM_PROMPT is defined earlier in this file
+        self.system_prompt = SYSTEM_PROMPT
+
+    def __len__(self) -> int:
+        """Returns the total number of scenes."""
+        return len(self.scenes)
+
+    def __next__(self) -> str:
+        """Returns the next scene description."""
+        if self.current_index >= len(self.scenes):
+            raise StopIteration
+
+        if self.random:
+            # If random, pick any index without advancing current_index persistently
+            idx = random.randint(0, len(self.scenes) - 1)
+        else:
+            idx = self.current_index
+            self.current_index += 1
+
+        scene_description = self.scenes[idx]
+
+        # Return only the scene description.
+        # The caller uses loader.pre_prompt and loader.system_prompt
+        return scene_description
+
+    def reset(self):
+        """Resets the iterator index."""
+        self.current_index = 0
+
+    def __iter__(self) -> 'SVGDataLoader':
+        return self
+
+
+def build_svg_dataloaders(test_split_ratio: float = 0.15) -> Tuple[SVGDataLoader, SVGDataLoader]:
+    """Builds and returns training and testing SVGDataLoaders."""
+    # Define SVG scenes
+    scenes = [
+        "man in a canoe on a calm lake at sunrise",
+        "two children building a sandcastle on a sunny beach",
+        "a black cat sleeping peacefully in a sunbeam on a windowsill",
+        "a detailed bowl of colourful fruit (apples, bananas, grapes) on a wooden table",
+        "a futuristic cityscape at night with flying cars",
+        "a knight facing a dragon in front of a castle",
+        "a cozy library scene with bookshelves, an armchair, and a reading lamp",
+        "astronaut planting a flag on the moon with Earth in the background",
+        "a bustling farmers market with stalls of vegetables and people",
+        "a serene underwater scene with coral reefs and colourful fish",
+        "a robot chef cooking pasta in a modern kitchen",
+        "three hot air balloons floating over rolling green hills",
+        "a group of penguins huddled together on an iceberg",
+        "a steaming cup of coffee on a rustic wooden table next to a book",
+        "a silhouette of a lone tree on a hill during sunset",
+        "a detailed illustration of the solar system with planets orbiting the sun",
+        "a whimsical village of mushroom houses in an enchanted forest",
+        "a busy train station platform with people and trains",
+        "a hummingbird sipping nectar from a vibrant flower",
+        "a stylized representation of a human brain with glowing connections",
+        "a traditional Japanese zen garden with raked sand patterns and carefully placed stones",
+        "a single red rose with dew drops on its petals",
+        "a world map made of interconnected puzzle pieces",
+        "a friendly cartoon monster waving hello",
+        "a classic red telephone box on a rainy London street",
+        "a bonfire crackling on a beach at night under the stars",
+        "a majestic eagle soaring over snow-capped mountains",
+        "a plate of sushi with chopsticks arranged neatly",
+        "a vintage record player spinning a vinyl disc",
+        "a greenhouse filled with exotic plants and flowers",
+        "a cozy fireplace with logs burning brightly and stockings hung",
+        "a hot air balloon floating over rolling green hills at sunrise",
+        "a futuristic robot dog playing fetch with a red ball in a park",
+        "a bustling city street at night with neon signs reflecting on wet pavement",
+        "a tall stack of pancakes with butter melting and syrup dripping down",
+        "a sailboat with full sails cruising on a calm blue ocean under a clear sky",
+        "an astronaut planting a flag on the moon surface with Earth visible in the dark sky",
+        "a colorful coral reef teeming with tropical fish, seaweed, and sea anemones",
+        "a detailed steampunk airship with gears and propellers docked at a sky-port",
+        "a wizard's cluttered study filled with glowing potions, ancient books, and a crystal ball",
+        "a tranquil Japanese zen garden with raked sand, mossy rocks, and a small pagoda",
+        "a vintage treasure map showing islands, sea monsters, and a dotted line to an X",
+        "a classic red telephone booth on a cobblestone street corner on a rainy day",
+        "a modern minimalist kitchen with stainless steel appliances and a bowl of fruit on the counter",
+        "a medieval castle with high stone walls and towers perched on a cliff overlooking the sea",
+        "a close-up view of a honeybee with detailed wings collecting pollen from a large sunflower",
+        "a Formula 1 race car speeding around a sharp corner of a track, showing motion blur",
+        "a cutaway view of an active volcano showing the magma chamber and lava flowing upwards",
+        "a diagram of the solar system showing the sun and planets with their orbital paths",
+        "a knight in shining armor holding a lance, riding a galloping horse through a forest"
+    ]
+    random.shuffle(scenes) # Shuffle before splitting
+
+    # Split into train/test sets
+    total_scenes = len(scenes)
+    test_size = int(total_scenes * test_split_ratio)
+    train_size = total_scenes - test_size
+
+    if test_size == 0 or train_size == 0:
+        if total_scenes > 0:
+            train_scenes = scenes
+            test_scenes = scenes
+        else:
+            train_scenes = []
+            test_scenes = []
+    else:
+        test_scenes = scenes[:test_size]
+        train_scenes = scenes[test_size:]
+
+    # Create data loaders
+    trainloader = SVGDataLoader(train_scenes, random=True)
+    testloader = SVGDataLoader(test_scenes, random=False)
+
+    print(f"Created SVG DataLoaders: {len(train_scenes)} train scenes, {len(test_scenes)} test scenes.")
+    return trainloader, testloader
+
+
 def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     """
     Factory function to get train and test data loaders for a specified dataset.
@@ -474,8 +615,10 @@ def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
         return build_ld_dataloaders()
     elif dataset_name.lower() == 'chopped':
         return build_chopped_dataloaders()
+    elif dataset_name.lower() == 'svg':
+        return build_svg_dataloaders()
     else:
-        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate', 'ld', and 'chopped' are available.")
+        raise ValueError(f"Dataset {dataset_name} not supported. Currently 'debate', 'ld', 'chopped', and 'svg' are available.")
 
 
 if __name__ == "__main__": 

@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Tuple, Any, Optional
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
 from model_interface import ModelInterface
+from PIL import Image
+import numpy as np
 
 from tqdm import tqdm
 
@@ -85,6 +87,8 @@ def get_evaluator(name: str) -> RewardEvaluator:
         return LDEvaluator()
     elif name.lower() == "chopped":
         return ChoppedEvaluator()
+    elif name.lower() == 'svg':
+        return SVGEvaluator()
     else:
         raise NotImplementedError(f"No evaluator implemented for {name}")
 
@@ -230,9 +234,9 @@ class DebateEvaluator(RewardEvaluator):
         
         metrics = {
             "rewards/debate_score": debate_scores.mean().item(),
-            "rewards/strict_format": strict_format.mean().item(),
-            "rewards/soft_format": soft_format.mean().item(),
-            "rewards/xml_count": xml_count.mean().item(),
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(),
+            "rewards/xml_count": xml_count.float().mean().item(),
             "reward": rewards_per_func.sum(dim=1).mean().item()
         }
         
@@ -305,9 +309,9 @@ class DebateEvaluator(RewardEvaluator):
             "reward": rewards_per_func.mean().item(),
             "num_wins": wins,
             "num_debates": num_debates,
-            "rewards/strict_format": strict_format.mean().item(),
-            "rewards/soft_format": soft_format.mean().item(), 
-            "rewards/xml_count": xml_count.mean().item()
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(), 
+            "rewards/xml_count": xml_count.float().mean().item()
         }
         
         return rewards_per_func, metrics
@@ -323,6 +327,8 @@ class DebateEvaluator(RewardEvaluator):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute rewards - different behavior for training vs testing."""
         if is_test:
+            if compare_model_completions is None:
+                 raise ValueError("compare_model_completions must be provided when is_test=True")
             return self._compute_test_rewards(input_prompt, all_models, train_model_completions, compare_model_completions, device)
         else:
             return self._compute_train_rewards(input_prompt, all_models, train_model_completions, device)
@@ -477,9 +483,9 @@ class LDEvaluator(RewardEvaluator):
         
         metrics = {
             "rewards/humor_score": humor_scores.mean().item(),
-            "rewards/strict_format": strict_format.mean().item(),
-            "rewards/soft_format": soft_format.mean().item(),
-            "rewards/xml_count": xml_count.mean().item(),
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(),
+            "rewards/xml_count": xml_count.float().mean().item(),
             "reward": rewards_per_func.sum(dim=1).mean().item()
         }
         
@@ -552,9 +558,9 @@ class LDEvaluator(RewardEvaluator):
             "reward": rewards_per_func.mean().item(),
             "num_wins": wins,
             "num_comparisons": num_comparisons,
-            "rewards/strict_format": strict_format.mean().item(),
-            "rewards/soft_format": soft_format.mean().item(), 
-            "rewards/xml_count": xml_count.mean().item()
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(), 
+            "rewards/xml_count": xml_count.float().mean().item()
         }
         
         return rewards_per_func, metrics
@@ -570,6 +576,8 @@ class LDEvaluator(RewardEvaluator):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute rewards - different behavior for training vs testing."""
         if is_test:
+            if compare_model_completions is None:
+                 raise ValueError("compare_model_completions must be provided when is_test=True")
             return self._compute_test_rewards(input_prompt, all_models, train_model_completions, compare_model_completions, device)
         else:
             return self._compute_train_rewards(input_prompt, all_models, train_model_completions, device)
@@ -726,9 +734,9 @@ class ChoppedEvaluator(RewardEvaluator):
         
         metrics = {
             "rewards/recipe_score": recipe_scores.mean().item(),
-            "rewards/strict_format": strict_format.mean().item(),
-            "rewards/soft_format": soft_format.mean().item(),
-            "rewards/xml_count": xml_count.mean().item(),
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(),
+            "rewards/xml_count": xml_count.float().mean().item(),
             "reward": rewards_per_func.sum(dim=1).mean().item()
         }
         
@@ -801,9 +809,9 @@ class ChoppedEvaluator(RewardEvaluator):
             "reward": rewards_per_func.mean().item(),
             "num_wins": wins,
             "num_comparisons": num_comparisons,
-            "rewards/strict_format": strict_format.mean().item(),
-            "rewards/soft_format": soft_format.mean().item(), 
-            "rewards/xml_count": xml_count.mean().item()
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(), 
+            "rewards/xml_count": xml_count.float().mean().item()
         }
         
         return rewards_per_func, metrics
@@ -819,6 +827,8 @@ class ChoppedEvaluator(RewardEvaluator):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute rewards - different behavior for training vs testing."""
         if is_test:
+            if compare_model_completions is None:
+                 raise ValueError("compare_model_completions must be provided when is_test=True")
             return self._compute_test_rewards(input_prompt, all_models, train_model_completions, compare_model_completions, device)
         else:
             return self._compute_train_rewards(input_prompt, all_models, train_model_completions, device)
@@ -831,5 +841,350 @@ class ChoppedEvaluator(RewardEvaluator):
             "soft_format": rewards[2].item(),
             "xml_count": rewards[3].item()
         }
+
+
+class SVGEvaluator(RewardEvaluator):
+    """
+
+    So - this will be pretty hardcoded to work for Qwen2.5 VL for now. 
+
+
+    Reward evaluator for SVG generation responses.
+    Uses a judge model to compare SVG quality and adherence to prompt via a conversational approach.
+    Includes format rewards for XML structure.
+    """
+
+    def __init__(self):
+        self.num_reward_functions = 4  # svg_score + 3 format rewards
+        # The detailed multi-turn prompt logic is now handled within the judge model's method.
+
+    def _extract_xml_answer(self, text: str) -> str:
+        """Extract the answer portion from XML tags."""
+        try:
+            answer = text.split("<answer>")[-1]
+            answer = answer.split("</answer>")[0]
+            return answer.strip()
+        except:
+            return "" # Return empty string if format is incorrect or answer is missing
+
+    def _is_valid_svg_code(self, svg_code: str) -> bool:
+        """Checks if the extracted answer looks like potentially valid SVG code."""
+        # Simple check: must not be empty and must start with <svg (case-insensitive)
+        return bool(svg_code) and svg_code.lower().startswith("<svg")
+
+    def _strict_format_reward(self, completions) -> List[float]:
+        """Reward for strict XML format."""
+        # Reuse the same format reward logic
+        # Note: Using re.DOTALL to match newlines within reasoning/answer
+        pattern = r"^<reasoning>.*?</reasoning>\s*<answer>.*?</answer>\s*$"
+        matches = [bool(re.match(pattern, c, re.DOTALL)) for c in completions]
+        return [0.5 if m else 0.0 for m in matches]
+
+    def _soft_format_reward(self, completions) -> List[float]:
+        """Reward for relaxed XML format."""
+        # Reuse the same format reward logic
+        pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+        # Use re.search to find the pattern anywhere, and re.DOTALL to match across newlines
+        matches = [bool(re.search(pattern, c, re.DOTALL)) for c in completions]
+        return [0.5 if m else 0.0 for m in matches]
+
+    def _xml_count_reward(self, completions) -> List[float]:
+        """Reward for XML tag counting."""
+        # Reuse the same format reward logic
+        def count_xml(text: str) -> float:
+            count = 0.0
+            if "<reasoning>" in text: count += 0.125
+            if "</reasoning>" in text: count += 0.125
+            if "<answer>" in text: count += 0.125
+            if "</answer>" in text: count += 0.125
+            # Only penalize actual content after final tag
+            if "</answer>" in text:
+                # Ensure split doesn't fail if tag isn't present
+                parts = text.split("</answer>", 1)
+                if len(parts) > 1:
+                    count -= len(parts[1].strip()) * 0.001
+            return max(0, count) # Ensure reward doesn't go negative
+
+        return [count_xml(c) for c in completions]
+
+    def _compute_train_rewards(
+        self,
+        input_prompt: str, # Here, input_prompt is the scene description
+        all_models: Dict[str, Any],
+        train_model_completions: List[str],
+        train_model_image_paths: List[str], # Add image paths input
+        device: str
+    ) -> Tuple[torch.Tensor, Dict[str, float], List[Dict[str, Any]], List[int]]: # Adjusted return type for pairwise_results
+        """Round-robin tournament scoring for training using image comparisons + format rewards."""
+        num_completions = len(train_model_completions)
+        rewards_per_func = torch.zeros(num_completions, self.num_reward_functions, device=device)
+
+        # Track wins/losses for each completion
+        wins = torch.zeros(num_completions, device=device)
+        losses = torch.zeros(num_completions, device=device)
+
+        scene_description = input_prompt # The prompt passed is the scene description
+        judge_model = all_models["judge_model"] # Get the judge model instance
+
+        def is_generated(img_path):
+            img = Image.open(img_path).convert('RGB')
+            img_data = np.array(img)
+            return np.all(img_data == [0, 0, 0])
+
+        # Get SVG scores using round-robin tournament with image comparisons
+        pairwise_results = [] # Initialize pairwise results list
+        for i in tqdm(range(num_completions), desc="Evaluating SVG completions (train)", leave=False):
+            image_path_1 = train_model_image_paths[i]
+
+            for j in range(i + 1, num_completions):
+                image_path_2 = train_model_image_paths[j]
+                winner = None
+                winner_idx = None # Track the index of the winner
+                final_verdict = "PRE_CHECK_FAILED" # Default if pre-check handles it
+                conversation_log = [] # Initialize empty log
+
+                # --- Black Image Pre-Check --- 
+                img1_is_black = is_generated(image_path_1)
+                img2_is_black = is_generated(image_path_2)
+
+                if img1_is_black and not img2_is_black:
+                    final_verdict = "SVG_2_WINS (Auto - Img1 not generated)"
+                    winner = 2
+                    winner_idx = j
+                elif not img1_is_black and img2_is_black:
+                    final_verdict = "SVG_1_WINS (Auto - Img2 not generated)"
+                    winner = 1
+                    winner_idx = i
+                elif img1_is_black and img2_is_black:
+                    final_verdict = "TIE_BOTH_NOT_GENERATED"
+                    winner = 3 # Treat as a tie
+                    winner_idx = None
+                else:
+                    final_verdict, conversation_log = judge_model.judge_svg_pair_conversationally(
+                        scene_description=scene_description,
+                        image_path_1=image_path_1,
+                        image_path_2=image_path_2,
+                        max_new_tokens=500, # Increased tokens for conversation
+                        temperature=0.1
+                    )
+                    final_verdict = final_verdict.strip().upper() # Ensure consistent format
+    
+
+                # Determine winner based on the final verdict string
+                if "SVG_1_WINS" in final_verdict:
+                    winner = 1
+                    winner_idx = i # Store index of winner
+                elif "SVG_2_WINS" in final_verdict:
+                    winner = 2
+                    winner_idx = j # Store index of winner
+                else:
+                    winner = 3 
+                    winner_idx = None
+                # else: no winner decided by judge, treat as tie for scoring
+
+                # Update wins/losses based on winner
+                if winner == 1:
+                    wins[i] += 1
+                    losses[j] += 1
+                elif winner == 2:
+                    wins[j] += 1
+                    losses[i] += 1
+                elif winner == 3:
+                    wins[i] += 0.5
+                    losses[j] += 0.5
+                    wins[j] += 0.5
+                    losses[i] += 0.5
+                # If winner is None (tie), no change to wins/losses
+
+                # Store comparison result
+                pairwise_results.append({
+                    'comp_1_idx': i,
+                    'comp_2_idx': j,
+                    'winner_idx': winner_idx, # Store winner index or None for tie/error
+                    'final_verdict': final_verdict, # Store the final verdict string
+                    'conversation_log': conversation_log # Store the full conversation log
+                })
+
+        # Calculate normalized scores (-1.5 to 1.5 range)
+        total_matches = num_completions - 1
+        # Avoid division by zero if only one completion
+        total_matches =  num_completions-1
+        win_rate = wins / total_matches
+        loss_rate = losses / total_matches
+        svg_scores = (win_rate - loss_rate) * 1.5  # Scale to desired range
+
+        # Get format rewards (remains the same)
+        strict_format = torch.tensor(self._strict_format_reward(train_model_completions), device=device)
+        soft_format = torch.tensor(self._soft_format_reward(train_model_completions), device=device)
+        xml_count = torch.tensor(self._xml_count_reward(train_model_completions), device=device)
+
+        # Combine all rewards
+        rewards_per_func[:, 0] = svg_scores
+        rewards_per_func[:, 1] = strict_format
+        rewards_per_func[:, 2] = soft_format
+        rewards_per_func[:, 3] = xml_count
+
+        metrics = {
+            "rewards/svg_score": svg_scores.mean().item(),
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(),
+            "rewards/xml_count": xml_count.float().mean().item(),
+            "reward": rewards_per_func.sum(dim=1).mean().item()
+        }
+
+        return rewards_per_func, metrics, pairwise_results, wins.tolist() # Return pairwise results and wins as a list
+
+    def _compute_test_rewards(
+        self,
+        prompt: str, # Scene description
+        all_models: Dict[str, Any],
+        train_model_completions: List[str],
+        compare_model_completions: List[str],
+        train_model_image_paths: List[str],
+        compare_model_image_paths: List[str],
+        device: str = "cuda"
+    ) -> Tuple[torch.Tensor, Dict[str, float]]: # Removed List return, test doesn't return pairwise results
+        """Head-to-head comparisons against base model for testing using conversational judging."""
+        num_comparisons = len(train_model_completions)
+        rewards_per_func = torch.zeros(num_comparisons, self.num_reward_functions, device=device)
+        wins = 0
+
+        scene_description = prompt
+        judge_model = all_models["judge_model"]
+
+        # Get format rewards first
+        strict_format = torch.tensor(self._strict_format_reward(train_model_completions), device=device)
+        soft_format = torch.tensor(self._soft_format_reward(train_model_completions), device=device)
+        xml_count = torch.tensor(self._xml_count_reward(train_model_completions), device=device)
+
+        def is_black_image(img_path): # Replicated helper function
+            try:
+                img = Image.open(img_path).convert('RGB')
+                img_data = np.array(img)
+                return np.all(img_data <= 5)
+            except Exception as e:
+                print(f"Warning: Could not open or process image {img_path}: {e}")
+                return True
+
+        test_results_summary = [] # Optional: Store summary of test verdicts
+
+        for i in range(num_comparisons):
+            trained_image_path = train_model_image_paths[i]
+            compare_image_path = compare_model_image_paths[i]
+            winner = None
+            final_verdict = "PRE_CHECK_FAILED"
+            conversation_log = [] # Log is generated but not stored long-term in test by default
+
+            # --- Black Image Pre-Check ---
+            trained_img_failed = is_black_image(trained_image_path)
+            compare_img_failed = is_black_image(compare_image_path)
+
+            if trained_img_failed and not compare_img_failed:
+                final_verdict = "SVG_2_WINS (Auto - Trained Img failed check)"
+                winner = 2 # Compare model wins
+            elif not trained_img_failed and compare_img_failed:
+                final_verdict = "SVG_1_WINS (Auto - Compare Img failed check)"
+                winner = 1 # Trained model wins
+            elif trained_img_failed and compare_img_failed:
+                final_verdict = "TIE_BOTH_FAILED"
+                winner = None # Tie
+            else:
+                # Call the conversational judging method
+                try:
+                    final_verdict, conversation_log = judge_model.judge_svg_pair_conversationally(
+                        scene_description=scene_description,
+                        image_path_1=trained_image_path, # SVG_1 is the trained model
+                        image_path_2=compare_image_path, # SVG_2 is the compare model
+                        max_new_tokens=500,
+                        temperature=0.1
+                    )
+                    final_verdict = final_verdict.strip().upper()
+                except AttributeError:
+                    raise NotImplementedError("The judge model does not have the required 'judge_svg_pair_conversationally' method.")
+                except Exception as e:
+                    print(f"Error during conversational judging for test comparison {i}: {e}")
+                    final_verdict = "JUDGING_ERROR"
+
+                # Determine winner based on the final verdict string
+                if "SVG_1_WINS" in final_verdict: # Trained model wins
+                    winner = 1
+                elif "SVG_2_WINS" in final_verdict: # Compare model wins
+                    winner = 2
+                # else: winner remains None (tie/error)
+
+            # Assign score based on winner (1.0 if trained model wins, 0.0 otherwise)
+            score = 0.0
+            if winner == 1:
+                score = 1.0
+                wins += 1
+            # No score added if compare model wins (winner==2) or it's a tie/error (winner==None)
+
+            rewards_per_func[i, 0] = score # SVG score is 1.0 for win, 0.0 otherwise
+            rewards_per_func[i, 1] = strict_format[i]
+            rewards_per_func[i, 2] = soft_format[i]
+            rewards_per_func[i, 3] = xml_count[i]
+
+            test_results_summary.append({'trained_idx': i, 'final_verdict': final_verdict, 'winner': winner})
+
+        win_rate = wins / num_comparisons if num_comparisons > 0 else 0.0
+        metrics = {
+            "win_rate": win_rate,
+            "reward": rewards_per_func.sum(dim=1).mean().item(), # Mean total reward across all functions
+            "num_wins": wins,
+            "num_comparisons": num_comparisons,
+            "rewards/strict_format": strict_format.float().mean().item(),
+            "rewards/soft_format": soft_format.float().mean().item(),
+            "rewards/xml_count": xml_count.float().mean().item(),
+            # "test_results_summary": test_results_summary # Optional: include summary if needed
+        }
+
+        # Note: _compute_test_rewards does not return pairwise_results or conversation logs by default
+        return rewards_per_func, metrics
+
+    def compute_rewards(
+        self,
+        input_prompt: str, # Expecting scene description string
+        all_models: Dict[str, Any],
+        train_model_completions: List[str],
+        compare_model_completions: Optional[List[str]] = None,
+        train_model_image_paths: Optional[List[str]] = None,
+        compare_model_image_paths: Optional[List[str]] = None,
+        device: str = "cuda",
+        is_test: bool = False
+    # Adjusted return type annotation to reflect changes
+    ) -> Tuple[torch.Tensor, Dict[str, float], Optional[List[Dict[str, Any]]], Optional[List[int]]]:
+        """Compute rewards - different behavior for training vs testing."""
+        # Ensure input_prompt is a string
+        if not isinstance(input_prompt, str):
+             raise TypeError(f"SVGEvaluator expects input_prompt to be a string (scene description), got {type(input_prompt)}")
+
+        if is_test:
+            # Test mode does not generate pairwise results, return None
+            rewards_per_func, metrics = self._compute_test_rewards(input_prompt, all_models, train_model_completions, compare_model_completions, train_model_image_paths, compare_model_image_paths, device)
+            return rewards_per_func, metrics
+        else:
+            # Train mode returns pairwise results and wins list
+            rewards_per_func, metrics, pairwise_results, wins_list = self._compute_train_rewards(input_prompt, all_models, train_model_completions, train_model_image_paths, device)
+            return rewards_per_func, metrics, pairwise_results, wins_list
+
+    def get_reward_breakdown(self, rewards: torch.Tensor) -> Dict[str, float]:
+        """Convert raw reward scores to a labeled dictionary."""
+        # Ensure tensor has the expected shape
+        if rewards.ndim == 1 and rewards.shape[0] == self.num_reward_functions:
+            return {
+                "svg_score": rewards[0].item(),
+                "strict_format": rewards[1].item(),
+                "soft_format": rewards[2].item(),
+                "xml_count": rewards[3].item()
+            }
+        else:
+            # Handle potential shape mismatch or return default/error
+            print(f"Warning: Unexpected reward tensor shape in get_reward_breakdown: {rewards.shape}")
+            return {
+                "svg_score": 0.0,
+                "strict_format": 0.0,
+                "soft_format": 0.0,
+                "xml_count": 0.0
+            }
 
 

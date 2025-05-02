@@ -22,17 +22,28 @@ def plot_metrics(output_dir):
 
     # Load training logs
     train_logs_path = os.path.join(output_dir, 'training_logs', 'train_logs.json')
+    if not os.path.exists(train_logs_path):
+        raise FileNotFoundError(f"Training log file not found at expected path: {train_logs_path}")
     with open(train_logs_path, 'r') as f:
         train_logs = json.load(f)
 
     # Load evaluation logs
     eval_logs = {}
     eval_logs_dir = os.path.join(output_dir, 'eval_logs')
-    for filename in os.listdir(eval_logs_dir):
-        if filename.startswith('metrics_') and filename.endswith('.json'):
-            step = int(filename.split('_')[1].split('.')[0])
-            with open(os.path.join(eval_logs_dir, filename), 'r') as f:
-                eval_logs[step] = json.load(f)
+    if os.path.exists(eval_logs_dir): # Check if eval logs directory exists
+        for filename in os.listdir(eval_logs_dir):
+            if filename.startswith('metrics_') and filename.endswith('.json'):
+                step = int(filename.split('_')[1].split('.')[0])
+                try:
+                    with open(os.path.join(eval_logs_dir, filename), 'r') as f:
+                        data = json.load(f)
+                        # Adjust structure: main.py nests metrics under 'metrics' key
+                        # and uses 'accuracy' key for win_rate in debate scenarios
+                        eval_logs[step] = data 
+                except json.JSONDecodeError:
+                    print(f"Warning: Could not decode JSON from {filename}")
+                except Exception as e:
+                    print(f"Warning: Error loading {filename}: {e}")
 
     # Set style and color palette
     plt.style.use('bmh')
@@ -102,21 +113,33 @@ def plot_metrics(output_dir):
         if eval_logs:
             eval_steps = sorted(eval_logs.keys())
             
-            # Plot win rate for debate or accuracy for GSM8k
+            # Check the structure of the first log entry to determine metric key
+            first_log_entry = eval_logs[eval_steps[0]]
+            
+            # Plot win rate (stored under 'accuracy' key from main.py eval) or accuracy
             plt.figure(figsize=(12,7))
-            if 'win_rate' in eval_logs[eval_steps[0]]['metrics']:
-                metric_values = [eval_logs[step]['metrics']['win_rate'] for step in eval_steps]
-                plt.plot(eval_steps, metric_values, color='#2ecc71', linewidth=2.0, label='Win Rate')
+            # Check if 'accuracy' exists and likely represents win rate, or if 'win_rate' is directly in nested 'metrics'
+            if 'accuracy' in first_log_entry: 
+                metric_values = [eval_logs[step].get('accuracy', 0) for step in eval_steps]
+                is_win_rate = 'win_rate' in first_log_entry.get('metrics', {}) # Double check if original win_rate exists
+                plot_label = 'Win Rate' if is_win_rate else 'Accuracy'
+                y_label = 'Win Rate (%)' if is_win_rate else 'Accuracy (%)'
+                plot_title = 'Chopped Test Set Debate Win Rate (Qwen 2.5-7B vs GPT-4)' if is_win_rate else 'Evaluation Accuracy'
+                
+                plt.plot(eval_steps, metric_values, color='#2ecc71', linewidth=2.0, label=plot_label)
                 plt.xlabel('Training Steps', fontsize=12)
-                plt.ylabel('Win Rate (%)', fontsize=12)
-                plt.title('Chopped Test Set Debate Win Rate (Qwen 2.5-7B vs GPT-4)', fontsize=24, pad=20)
+                plt.ylabel(y_label, fontsize=12)
+                plt.title(plot_title, fontsize=24 if is_win_rate else 14, pad=20)
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 pdf.savefig(bbox_inches='tight')
-                plt.savefig(os.path.join(output_dir, 'win_rate.png'), bbox_inches='tight')
+                # Save win rate as a separate PNG if it is win rate
+                if is_win_rate:
+                    plt.savefig(os.path.join(output_dir, 'win_rate.png'), bbox_inches='tight')
                 plt.close()
-            else:
-                metric_values = [eval_logs[step].get('accuracy', 0) for step in eval_steps]
+            elif 'metrics' in first_log_entry and 'accuracy' in first_log_entry['metrics']:
+                 # Fallback if 'accuracy' is nested under 'metrics' (less likely based on main.py)
+                metric_values = [eval_logs[step].get('metrics', {}).get('accuracy', 0) for step in eval_steps]
                 plt.plot(eval_steps, metric_values, color='#2ecc71', linewidth=2.0, label='Accuracy')
                 plt.xlabel('Training Steps', fontsize=12)
                 plt.ylabel('Accuracy (%)', fontsize=12)
@@ -125,6 +148,8 @@ def plot_metrics(output_dir):
                 plt.legend()
                 pdf.savefig(bbox_inches='tight')
                 plt.close()
+            else:
+                 print("Warning: Could not find 'accuracy' or 'win_rate' key in evaluation logs.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Plot training metrics from logs directory')

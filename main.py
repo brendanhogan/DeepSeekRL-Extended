@@ -9,11 +9,53 @@ from tqdm import tqdm
 from collections import defaultdict
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
 from model_interface import ModelInterface
+import re
+import cairosvg
+from PIL import Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportlabImage, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+import html
+import gc
+import shutil
+from datetime import datetime, timedelta
 
 import llms
 import utils
 import evaluator
 import rldatasets
+
+def render_svg_or_fallback(completion_text: str, output_png_path: str):
+    """
+    Extracts SVG from <answer> tags, renders to PNG if valid, or saves a fallback.
+    If even fallback generation fails, returns None.
+
+    Args:
+        completion_text: The raw text output from the model.
+        output_png_path: The desired path to save the output PNG.
+
+    Returns:
+        The path to the saved PNG (rendered or fallback), or None on critical failure.
+    """
+    try: 
+        # If anything in here fails, we return an all black image 
+        answer_match = re.search(r"<answer>(.*?)</answer>", completion_text, re.DOTALL | re.IGNORECASE)
+        extracted_svg = answer_match.group(1).strip()
+        cairosvg.svg2png(
+            bytestring=extracted_svg.encode('utf-8'),
+            write_to=output_png_path,
+            output_width=224,
+            output_height=224
+        )
+        return output_png_path
+    except:
+        black_img = Image.new('RGB', (224, 224), (0, 0, 0))
+        black_img.save(output_png_path)
+        black_img.close()  # Properly close the image to free resources
+        return output_png_path
 
 def eval_on_test_set(
     all_models: dict,
@@ -25,168 +67,215 @@ def eval_on_test_set(
 ) -> tuple[dict[str, float], float]:
     """
     Evaluate model performance on test set by comparing each model completion
-    against a base model completion and having them judged.
+    against a base model completion and having them judged. Generates a PDF report.
     """
     print("Running evaluation on test set...")
     
     total_scores = defaultdict(float)
     num_examples = 0
+    total_comparisons = 0 # Renamed from total_wins in original code, seems it was counting comparisons
     total_wins = 0
 
-    log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
+    # Setup PDF document
+    pdf_path = os.path.join(args.output_dir, "eval_logs", f'eval_report_{round_num}.pdf')
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    # Custom styles
+    styles.add(ParagraphStyle(name='CodeStyle', parent=styles['Code'], fontName='Courier', fontSize=9, leading=11))
+    styles.add(ParagraphStyle(name='HeaderStyle', parent=styles['h1'], alignment=TA_CENTER))
+    styles.add(ParagraphStyle(name='SubHeaderStyle', parent=styles['h2'], alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name='NormalLeft', parent=styles['Normal'], alignment=TA_LEFT))
+
+    story = []
+    story.append(Paragraph(f"Evaluation Report - Round {round_num}", styles['HeaderStyle']))
+    story.append(Spacer(1, 0.3*inch))
+
+    output_dir_eval = os.path.join(args.output_dir,"eval_logs", f'eval_images_{round_num}')
+    os.makedirs(output_dir_eval, exist_ok=True)
+
     test_loader.reset()
     
-    with open(log_file, 'w') as f:
-        total_comparisons = 0
-        total_wins = 0
-        
-        for question in tqdm(test_loader, desc="Evaluating on test set"):
-            num_examples += 1
+    for question in tqdm(test_loader, desc="Evaluating on test set"):
+        num_examples += 1
 
-            # 1. Prepare prompting
-            prompt = [
-                {'role': 'system', 'content': test_loader.pre_prompt},
-                {'role': 'user', 'content': question}
-            ]
-            prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False)
+        # --- PDF Section: Question Header ---
+        story.append(Paragraph(f"Question {num_examples}", styles['SubHeaderStyle']))
+        story.append(Spacer(1, 0.1*inch))
+        story.append(Paragraph("Setting:", styles['h3']))
+        story.append(Paragraph(html.escape(question), styles['CodeStyle']))
+        story.append(Spacer(1, 0.1*inch))
 
-            # Log Initial prompt 
-            f.write("\n" + "="*80 + "\n")
-            f.write(f"Example #{num_examples}\n")
-            f.write("="*80 + "\n\n")
-            
-            f.write("Prompt:\n")
-            f.write(f"{prompt_text}\n\n")
+        # 1. Prepare prompting
+        prompt = [
+            {'role': 'system', 'content': test_loader.pre_prompt},
+            {'role': 'user', 'content': f"Scene Description: {question}"}
+        ]
+        prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False, add_generation_prompt=True,enable_thinking=False)
 
-            # Generate completions from trained model
-            _, _, _, _, completions_text, _ = generate_completions(
-                all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args
+        # --- PDF Section: Full Prompt ---
+        story.append(Paragraph("Full Prompt (Input to Both Models):", styles['h3']))
+        story.append(Paragraph(html.escape(prompt_text), styles['CodeStyle'])) # Use <br/> for newlines in PDF
+        story.append(Spacer(1, 0.2*inch))
+
+        ###########################################
+        ## Generate completions + render images ##
+        ###########################################
+        # Generate completions from trained model
+        _, _, _, _, completions_text, _ = generate_completions(all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args, args.eval_num_chains)
+
+        train_model_image_paths = []
+        for i, completion in enumerate(completions_text):
+            img_path = os.path.join(output_dir_eval, f"trained_model_example_{num_examples}_completion_{i}.png")
+            train_model_image_paths.append(render_svg_or_fallback(completion, img_path))
+
+        # Generate completions for compare model using the interface
+        compare_completions_text = []
+        for _ in range(args.eval_num_chains):
+            completion = all_models["compare_model"].generate(
+                system_prompt=test_loader.pre_prompt,
+                user_prompt=question,
+                max_new_tokens=args.max_completion_length,
+                temperature=args.temperature
             )
+            compare_completions_text.append(completion)
 
-            # Generate completions for compare model using the interface
-            compare_completions_text = []
-            for _ in range(args.num_chains):
-                completion = all_models["compare_model"].generate(
-                    system_prompt=test_loader.pre_prompt,
-                    user_prompt=question,
-                    max_new_tokens=args.max_completion_length,
-                    temperature=args.temperature
-                )
-                compare_completions_text.append(completion)
+        compare_model_image_paths = []
+        for i, completion in enumerate(compare_completions_text):
+            img_path = os.path.join(output_dir_eval, f"compare_model_example_{num_examples}_completion_{i}.png")
+            compare_model_image_paths.append(render_svg_or_fallback(completion, img_path))
 
-            # Score completions to get reward metrics
-            rewards_per_func, reward_metrics = eval_class.compute_rewards(
-                input_prompt=question, 
-                all_models=all_models, 
-                train_model_completions=completions_text, 
-                compare_model_completions=compare_completions_text,
-                device=device,
-                is_test=True
-            )
+        ###########################################
+        ## Score completions + get reward metrics ##
+        ###########################################
+        rewards_per_func, reward_metrics = eval_class.compute_rewards(
+            input_prompt=question, 
+            all_models=all_models, 
+            train_model_completions=completions_text, 
+            compare_model_completions=compare_completions_text,
+            train_model_image_paths=train_model_image_paths,
+            compare_model_image_paths=compare_model_image_paths,
+            device=device,
+            is_test=True
+        )
 
-            # Track total comparisons and wins
-            comparisons_this_question = len(completions_text)
-            total_comparisons += comparisons_this_question
-            total_wins += reward_metrics['num_wins']
+        # Track total comparisons and wins
+        comparisons_this_question = len(completions_text)
+        total_comparisons += comparisons_this_question
+        total_wins += reward_metrics['num_wins'] # Assuming reward_metrics has 'num_wins'
 
-            # For each completion pair, log the results
-            for i, (completion, compare_completion) in enumerate(zip(completions_text, compare_completions_text)):
-                f.write(f"\nCompletion #{i+1}:\n")
-                f.write("-"*40 + "\n\n")
+        # --- PDF Section: Per Completion Details ---
+        for i, (completion, compare_completion) in enumerate(zip(completions_text, compare_completions_text)):
+            story.append(Paragraph(f"Completion {i+1}", styles['SubHeaderStyle']))
+            story.append(Spacer(1, 0.1*inch))
 
-                # Log trained model's response
-                f.write("TRAINED MODEL RESPONSE:\n")
-                f.write(f"Full response:\n{completion}\n\n")
-                
-                try:
-                    trained_reasoning = completion.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
-                    trained_answer = completion.split("<answer>\n")[1].split("\n</answer>")[0]
-                except:
-                    trained_reasoning = "ERROR: Could not parse reasoning"
-                    trained_answer = "ERROR: Could not parse answer"
-                
-                f.write(f"Parsed reasoning:\n{trained_reasoning}\n")
-                f.write(f"Parsed answer:\n{trained_answer}\n\n")
+            # Trained model details
+            story.append(Paragraph("Trained Model Response:", styles['h3']))
+            story.append(Paragraph(html.escape(completion), styles['CodeStyle']))
+            try:
+                trained_reasoning = completion.split("<reasoning>")[1].split("</reasoning>")[0].strip()
+                trained_answer = completion.split("<answer>")[1].split("</answer>")[0].strip()
+                story.append(Paragraph("Parsed Reasoning:", styles['h4']))
+                story.append(Paragraph(html.escape(trained_reasoning), styles['CodeStyle']))
+                story.append(Paragraph("Parsed Answer:", styles['h4']))
+                story.append(Paragraph(html.escape(trained_answer), styles['CodeStyle']))
+            except Exception:
+                story.append(Paragraph("ERROR: Could not parse reasoning/answer.", styles['CodeStyle']))
+            story.append(Spacer(1, 0.1*inch))
 
-                # Log compare model's response
-                f.write("COMPARE MODEL RESPONSE:\n")
-                f.write(f"Full response:\n{compare_completion}\n\n")
-                
-                try:
-                    compare_reasoning = compare_completion.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
-                    compare_answer = compare_completion.split("<answer>\n")[1].split("\n</answer>")[0]
-                except:
-                    compare_reasoning = "ERROR: Could not parse reasoning"
-                    compare_answer = "ERROR: Could not parse answer"
-                
-                f.write(f"Parsed reasoning:\n{compare_reasoning}\n")
-                f.write(f"Parsed answer:\n{compare_answer}\n\n")
+            # Compare model details
+            story.append(Paragraph("Compare Model Response:", styles['h3']))
+            story.append(Paragraph(html.escape(compare_completion), styles['CodeStyle']))
+            try:
+                compare_reasoning = compare_completion.split("<reasoning>")[1].split("</reasoning>")[0].strip()
+                compare_answer = compare_completion.split("<answer>")[1].split("</answer>")[0].strip()
+                story.append(Paragraph("Parsed Reasoning:", styles['h4']))
+                story.append(Paragraph(html.escape(compare_reasoning), styles['CodeStyle']))
+                story.append(Paragraph("Parsed Answer:", styles['h4']))
+                story.append(Paragraph(html.escape(compare_answer), styles['CodeStyle']))
+            except Exception:
+                 story.append(Paragraph("ERROR: Could not parse reasoning/answer.", styles['CodeStyle']))
+            story.append(Spacer(1, 0.1*inch))
 
-                # Log reward scores for this completion
-                f.write("REWARD SCORES:\n")
-                reward_breakdown = eval_class.get_reward_breakdown(rewards_per_func[i])
-                for reward_name, reward_value in reward_breakdown.items():
-                    f.write(f"{reward_name}: {reward_value:.4f}\n")
-                f.write(f"Total reward: {rewards_per_func[i].sum().item():.4f}\n")
+            # Images side-by-side
+            try:
+                img1 = ReportlabImage(train_model_image_paths[i], width=2*inch, height=2*inch)
+                img2 = ReportlabImage(compare_model_image_paths[i], width=2*inch, height=2*inch)
+                img_table_data = [
+                    [Paragraph("Trained Model Image", styles['NormalLeft']), Paragraph("Compare Model Image", styles['NormalLeft'])],
+                    [img1, img2]
+                ]
+                img_table = Table(img_table_data, colWidths=[3*inch, 3*inch])
+                img_table.setStyle(TableStyle([
+                    ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                    ('VALIGN', (0, 1), (-1, -1), 'TOP'),
+                    ('BOX', (0, 1), (0, 1), 0.25, colors.black), # Box around first image
+                    ('BOX', (1, 1), (1, 1), 0.25, colors.black), # Box around second image
+                ]))
+                story.append(Paragraph("Judge Input Images:", styles['h3']))
+                story.append(img_table)
+                story.append(Spacer(1, 0.1*inch))
+            except Exception as e:
+                story.append(Paragraph(f"Error displaying images: {e}", styles['CodeStyle']))
 
-                # Log if trained model won this comparison
-                trained_model_won = rewards_per_func[i,0] > 0
-                f.write(f"\nOUTCOME: Trained model {'won' if trained_model_won else 'lost'} this comparison\n")
-                f.write("-"*40 + "\n")
+            # Judging Result
+            trained_model_won = rewards_per_func[i, 0] > 0 # Assuming first element indicates win/loss
+            outcome_text = "TRAINED MODEL WINS" if trained_model_won else "TRAINED MODEL LOSES"
+            story.append(Paragraph(f"Outcome: {outcome_text}", styles['h3']))
+            story.append(Spacer(1, 0.1*inch))
 
-            # Log summary metrics for this question
-            f.write("\nSUMMARY METRICS:\n")
-            f.write(f"Win rate: {reward_metrics['win_rate']:.2%}\n")
-            f.write(f"Number of wins: {reward_metrics['num_wins']}\n")
-            f.write(f"Total comparisons: {reward_metrics['num_comparisons']}\n")
-            f.write(f"Average format scores:\n")
-            f.write(f"  Strict format: {reward_metrics['rewards/strict_format']:.4f}\n")
-            f.write(f"  Soft format: {reward_metrics['rewards/soft_format']:.4f}\n")
-            f.write(f"  XML count: {reward_metrics['rewards/xml_count']:.4f}\n")
+            # Reward Scores Breakdown
+            story.append(Paragraph("Reward Scores:", styles['h3']))
+            reward_breakdown = eval_class.get_reward_breakdown(rewards_per_func[i])
+            for reward_name, reward_value in reward_breakdown.items():
+                story.append(Paragraph(f"{reward_name}: {reward_value:.4f}", styles['CodeStyle']))
+            story.append(Paragraph(f"Total reward: {rewards_per_func[i].sum().item():.4f}", styles['CodeStyle']))
+            story.append(Spacer(1, 0.2*inch)) # Spacer after each completion block
 
-            # Update total scores
-            for k, v in reward_metrics.items():
-                if k.startswith('rewards/'):
-                    total_scores[k] += v
-        
-        # Calculate final metrics
-        win_rate = (total_wins / total_comparisons) * 100 if total_comparisons > 0 else 0
-        avg_scores = {k: v/num_examples for k,v in total_scores.items()}
+        # Update total scores for summary
+        for k, v in reward_metrics.items():
+            if k.startswith('rewards/'):
+                total_scores[k] += v
 
-        # Save metrics
-        metrics = {
-            'win_rate': win_rate,
-            'total_wins': total_wins,
-            'total_comparisons': total_comparisons,
-            'num_examples': num_examples,
-            'average_scores': avg_scores
-        }
+    # Calculate final metrics
+    win_rate = (total_wins / total_comparisons) * 100 if total_comparisons > 0 else 0
+    avg_scores = {k: v/num_examples for k,v in total_scores.items() if num_examples > 0}
 
-        # Write summary results to file and optionally print
-        f.write("\nFINAL EVALUATION RESULTS:\n")
-        f.write("-" * 20 + "\n")
-        f.write(f"Win Rate: {win_rate:.2f}%\n")
-        f.write(f"Total Wins: {total_wins}\n") 
-        f.write(f"Total Comparisons: {total_comparisons}\n")
-        f.write("\nAverage Scores:\n")
-        for metric, value in avg_scores.items():
-            f.write(f"{metric:15s}: {value:.4f}\n")
-        f.write("-" * 20 + "\n")
+    # Final metrics dictionary (for JSON logging)
+    metrics = {
+        'win_rate': win_rate,
+        'total_wins': total_wins,
+        'total_comparisons': total_comparisons,
+        'num_examples': num_examples,
+        'average_scores': avg_scores
+    }
 
-        if args.verbose:
-            print("\nEvaluation Results:")
-            print("-" * 20)
-            print(f"Win Rate: {win_rate:.2f}%")
-            print(f"Total Wins: {total_wins}")
-            print(f"Total Comparisons: {total_comparisons}")
-            print("\nAverage Scores:")
-            for metric, value in avg_scores.items():
-                print(f"{metric:15s}: {value:.4f}")
-            print("-" * 20)
+    # --- PDF Section: Final Summary ---
+    story.append(Paragraph("FINAL EVALUATION RESULTS", styles['SubHeaderStyle']))
+    story.append(Spacer(1, 0.2*inch))
+    summary_text = [
+        f"Win Rate: {win_rate:.2f}%",
+        f"Total Wins: {total_wins}",
+        f"Total Comparisons: {total_comparisons}",
+        f"Number of Questions: {num_examples}",
+        "\nAverage Scores:"
+    ]
+    for metric, value in avg_scores.items():
+       summary_text.append(f"  {metric.replace('rewards/', ''):<15}: {value:.4f}")
 
+    story.append(Paragraph("<br/>".join(html.escape(line) for line in summary_text), styles['CodeStyle']))
+
+    doc.build(story)
+    
+    # Clean up memory-intensive objects
+    del story
+    del doc
+    torch.cuda.empty_cache()
+    
+    # Keep JSON logging
     metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=4)
+    
 
     return metrics, win_rate
 
@@ -195,7 +284,8 @@ def generate_completions(
     tokenizer: PreTrainedTokenizerBase, 
     prompt_text: str,
     device: str,
-    args: argparse.Namespace
+    args: argparse.Namespace, 
+    num_chains: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], str]:
     """
     Generate multiple completion sequences for a given prompt using a language model.
@@ -225,8 +315,8 @@ def generate_completions(
     prompt_mask = prompt_mask[:, -args.max_prompt_length:]
     
     # Repeat for number of chains/generations
-    prompt_ids = prompt_ids.repeat(args.num_chains, 1)
-    prompt_mask = prompt_mask.repeat(args.num_chains, 1)
+    prompt_ids = prompt_ids.repeat(num_chains, 1)
+    prompt_mask = prompt_mask.repeat(num_chains, 1)
 
     # Move tensors to device
     prompt_ids = prompt_ids.to(device)
@@ -271,7 +361,8 @@ def score_completions(
     question: str,
     eval_class: evaluator.RewardEvaluator,
     device: str,
-    args: argparse.Namespace
+    args: argparse.Namespace,
+    train_model_image_paths: list[str]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], dict]:
     """
     Score model completions and compute advantages for training.
@@ -290,6 +381,8 @@ def score_completions(
         rewards_per_func: Rewards broken down by individual reward functions
         metrics: Dictionary of aggregated metrics
         log_data: Dictionary containing detailed generation and scoring data
+        pairwise_results: List containing pairwise comparison results (or None)
+        wins_list: List containing win counts for each completion (or None)
     """
     # Build log data dictionary
     log_data = {
@@ -301,16 +394,17 @@ def score_completions(
 
     # Format inputs as expected by evaluator
     # Get rewards and metrics from evaluator
-    rewards_per_func, metrics = eval_class.compute_rewards(
+    rewards_per_func, metrics, pairwise_results, wins_list = eval_class.compute_rewards(
         input_prompt=question,
         all_models=all_models, 
         train_model_completions=completions_text, 
+        train_model_image_paths=train_model_image_paths,
         compare_model_completions=None,
         device=device, 
         is_test=False
     )
-    rewards = rewards_per_func.sum(dim=1)
 
+    rewards = rewards_per_func.sum(dim=1)
 
     # Store generation data
     for i, (completion, reward_scores) in enumerate(zip(completions_text, rewards_per_func)):
@@ -340,7 +434,7 @@ def score_completions(
         'advantages': advantages.tolist()
     }
 
-    return rewards, advantages, rewards_per_func, metrics, log_data
+    return rewards, advantages, rewards_per_func, metrics, log_data, pairwise_results, wins_list
 
 def compute_loss(
     model: PreTrainedModel,
@@ -401,6 +495,7 @@ def compute_loss(
     return loss, metrics
 
 def grpo_loss(
+        test_loader,
         train_loader,
         all_models: dict,
         question: str,
@@ -409,73 +504,325 @@ def grpo_loss(
         round_num: int,
         training_log_dir: str, 
         args: argparse.Namespace
-) -> tuple[torch.Tensor, dict[str, float], float]:
+) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    Compute GRPO loss between the current model and base model.
+    Compute GRPO loss and log training details to a PDF for the round.
     
     Args:
-        model: The current model being trained
-        base_model: The reference model to compare against
-        tokenizer: Tokenizer for the models
+        test_loader: DataLoader for test set (to get pre_prompt)
+        train_loader: DataLoader for train set
+        all_models: Dictionary containing all models and tokenizers
         question: Input question/prompt
-        answer: Ground truth answer
         eval_class: Evaluator for computing rewards
         device: Device to run on ('cpu' or 'cuda')
         round_num: Current training round number
-        training_log_dir: Directory to save training logs
+        training_log_dir: Directory to save training logs and PDF
         args: Training arguments
         
     Returns:
         loss: The computed GRPO loss
         metrics: Dictionary containing training metrics
-        reward: The total reward for this batch
     """
 
+    # --- PDF Setup ---
+    pdf_path = os.path.join(training_log_dir, f'training_report_round_{round_num}.pdf')
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    # Custom styles (same as eval)
+    styles.add(ParagraphStyle(name='CodeStyle', parent=styles['Code'], fontName='Courier', fontSize=9, leading=11))
+    styles.add(ParagraphStyle(name='HeaderStyle', parent=styles['h1'], alignment=TA_CENTER))
+    styles.add(ParagraphStyle(name='SubHeaderStyle', parent=styles['h2'], alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name='NormalLeft', parent=styles['Normal'], alignment=TA_LEFT))
+    # Add a smaller code style specifically for the conversation log
+    styles.add(ParagraphStyle(name='SmallCodeStyle', parent=styles['Code'], fontName='Courier', fontSize=6, leading=7))
+    story = []
+    story.append(Paragraph(f"Training Report - Round {round_num}", styles['HeaderStyle']))
+    story.append(Spacer(1, 0.3*inch))
+
+    # List to keep track of opened image files for manual closing
+    opened_files = []
+
+    # --- Prompt Formatting & PDF Logging ---
     prompt = [
         {'role': 'system', 'content': test_loader.pre_prompt},
         {'role': 'user', 'content': question}
     ]
-    prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False)
+    prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False, add_generation_prompt=True,enable_thinking=False)
+    story.append(Paragraph("Full Prompt:", styles["SubHeaderStyle"]))
+    story.append(Paragraph(html.escape(prompt_text), styles["CodeStyle"]))
+    story.append(Spacer(1, 0.2*inch))
 
-    # Generate completions
+    # --- Generate Completions & Render Images ---
     prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, _ = generate_completions(
-        all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args
+        all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args, args.num_chains
     )
-    # Score completions
-    rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
-        completions_text, question, eval_class, device, args
+    
+    image_dir = os.path.join(training_log_dir, "images", f"round_{round_num}")
+    os.makedirs(image_dir, exist_ok=True)
+    
+    train_model_image_paths = []
+    for i, completion in enumerate(completions_text):
+        img_path = os.path.join(image_dir, f"completion_{i}.png")
+        render_svg_or_fallback(completion, img_path)
+        train_model_image_paths.append(img_path)
+
+    # --- Score Completions ---
+    rewards, advantages, rewards_per_func, metrics, log_data, pairwise_results, wins_list = score_completions(
+        completions_text, question, eval_class, device, args, train_model_image_paths
     )
 
-    # Write log data
-    log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
-    utils.write_generation_log(log_data, log_file)
 
-    # Compute loss
+    # --- PDF Logging: Individual Completions ---
+    if round_num % 50 == 0:
+        story.append(Paragraph("Generated Completions & Scores:", styles["SubHeaderStyle"]))
+        story.append(Spacer(1, 0.1*inch))
+        completion_details = [] # For ranking later
+
+        for i, completion in enumerate(completions_text):
+            story.append(Paragraph(f"Completion {i+1}", styles["h3"]))
+            
+            # Full Response
+            story.append(Paragraph("Full Response:", styles["h4"]))
+            story.append(Paragraph(html.escape(completion), styles['CodeStyle']))
+            story.append(Spacer(1, 0.05*inch))
+            
+            # Parsed Sections
+            try:
+                trained_reasoning = completion.split("<reasoning>")[1].split("</reasoning>")[0].strip()
+                trained_answer = completion.split("<answer>")[1].split("</answer>")[0].strip()
+                story.append(Paragraph("Parsed Reasoning:", styles["h4"]))
+                story.append(Paragraph(html.escape(trained_reasoning), styles["CodeStyle"]))
+                story.append(Paragraph("Parsed Answer:", styles["h4"]))
+                story.append(Paragraph(html.escape(trained_answer), styles["CodeStyle"]))
+            except Exception:
+                story.append(Paragraph("ERROR: Could not parse reasoning/answer.", styles["CodeStyle"]))
+            story.append(Spacer(1, 0.05*inch))
+            
+            # Image
+            img_obj = None
+            try:
+                img_path = train_model_image_paths[i]
+                f = open(img_path, 'rb')
+                opened_files.append(f)
+                img_obj = ReportlabImage(f, width=1.5*inch, height=1.5*inch)
+                story.append(Paragraph("Generated Image:", styles["h4"]))
+                story.append(img_obj)
+            except Exception as e:
+                story.append(Paragraph(f"Error displaying image {i} ({os.path.basename(train_model_image_paths[i])}): {e}", styles["CodeStyle"]))
+            story.append(Spacer(1, 0.05*inch))
+            
+            # Scores
+            story.append(Paragraph("Reward Scores:", styles["h4"]))
+            reward_breakdown = eval_class.get_reward_breakdown(rewards_per_func[i])
+            primary_score = rewards_per_func[i, 0].item() # Assume first score is primary for ranking
+            for reward_name, reward_value in reward_breakdown.items():
+                story.append(Paragraph(f"{reward_name}: {reward_value:.4f}", styles["CodeStyle"]))
+            story.append(Paragraph(f"Total reward: {rewards[i].item():.4f}", styles["CodeStyle"]))
+            story.append(Paragraph(f"Advantage: {advantages[i].item():.4f}", styles["CodeStyle"]))
+            story.append(Spacer(1, 0.2*inch))
+            
+            # Collect details for ranking
+            completion_details.append({
+                'score': primary_score,
+                'text': completion,
+                'image_path': train_model_image_paths[i],
+                'index': i,
+                'wins': wins_list[i] if wins_list else 0 # Add win count
+            })
+            
+            # No need to del img_obj here, file handle is managed in opened_files
+
+        # --- PDF Logging: Ranked List ---
+        story.append(Paragraph("Ranked Completions (by Primary Score):", styles["SubHeaderStyle"]))
+        story.append(Spacer(1, 0.1*inch))
+
+        # Calculate total matches for win rate
+        num_completions = len(completions_text)
+        total_matches_per_completion = max(1, num_completions - 1)
+        
+        # Sort completions by primary score (descending)
+        ranked_completions = sorted(completion_details, key=lambda x: x['score'], reverse=True)
+        
+        rank_table_data = [["Rank", "Score", "Wins", "Win Rate", "Image", "Original Index"]]
+        rank_table_style = [('BACKGROUND', (0,0), (-1,0), colors.grey),
+                            ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+                            ('ALIGN',(0,0),(-1,-1),'CENTER'),
+                            ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+                            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                            ('BOTTOMPADDING', (0,0), (-1,0), 12),
+                            ('BACKGROUND',(0,1),(-1,-1),colors.beige),
+                            ('GRID',(0,0),(-1,-1),1,colors.black)]
+
+        for rank, details in enumerate(ranked_completions):
+            img_cell = None
+            try:
+                img_path = details['image_path']
+                f = open(img_path, 'rb')
+                opened_files.append(f)
+                img_cell = ReportlabImage(f, width=1*inch, height=1*inch)
+            except Exception as e:
+                img_cell = Paragraph(f"Error: {e}", styles["CodeStyle"])
+            win_rate = (details['wins'] / total_matches_per_completion) if total_matches_per_completion > 0 else 0
+            rank_table_data.append([
+                f"{rank+1}", 
+                f"{details['score']:.4f}", 
+                f"{details['wins']}", # Add wins column
+                f"{win_rate:.1%}", # Add win rate column
+                img_cell, 
+                f"{details['index']+1}"
+            ])
+            
+        rank_table = Table(rank_table_data, colWidths=[0.5*inch, 0.8*inch, 0.5*inch, 0.8*inch, 1.2*inch, 1*inch]) # Adjust colWidths
+        rank_table.setStyle(TableStyle(rank_table_style))
+        story.append(rank_table)
+        story.append(Spacer(1, 0.3*inch))
+
+        # --- PDF Logging: Pairwise Comparison Details ---
+        if pairwise_results is not None:
+            story.append(Paragraph("Pairwise Comparison Details (Conversational):", styles["SubHeaderStyle"]))
+            story.append(Spacer(1, 0.1*inch))
+
+            # Updated headers for conversational logging
+            comparison_table_data = [["Comparison", "Image 1", "Image 2", "Final Verdict", "Conversation Log"]]
+            comparison_table_style = [
+                ('BACKGROUND', (0,0), (-1,0), colors.darkblue),
+                ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+                ('ALIGN',(0,0),(-1,-1),'CENTER'),
+                ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0,0), (-1,0), 12),
+                ('BACKGROUND',(0,1),(-1,-1),colors.lightblue),
+                ('GRID',(0,0),(-1,-1),1,colors.black),
+                ('VALIGN',(4,1), (4,-1), 'TOP'), # Align conversation log to top
+                ('ALIGN',(4,1), (4,-1), 'LEFT'), # Align conversation log to left
+            ]
+
+            for result in pairwise_results:
+                idx1 = result['comp_1_idx']
+                idx2 = result['comp_2_idx']
+                winner_idx = result['winner_idx']
+                final_verdict_text = result.get('final_verdict', 'N/A') # Get final verdict
+                conversation_log = result.get('conversation_log', {}) # Get conversation log
+
+                # Format conversation log as a JSON string for the PDF cell
+                try:
+                    # Use html.escape to handle special characters within the JSON string
+                    log_str_full = html.escape(json.dumps(conversation_log, indent=2))
+                    # Truncate if too long to prevent LayoutError
+                    max_log_length = 1000 # Adjust this character limit as needed
+                    if len(log_str_full) > max_log_length:
+                        log_str = log_str_full[:max_log_length] + "... (truncated)"
+                    else:
+                        log_str = log_str_full
+                    # Replace newlines with <br/> for ReportLab Paragraph
+                    # Use the new SmallCodeStyle for the log paragraph
+                    log_paragraph = Paragraph(log_str.replace('\\n', '<br/>'), styles["SmallCodeStyle"])
+                except Exception as e:
+                    log_paragraph = Paragraph(f"Error formatting log: {e}", styles["SmallCodeStyle"]) # Use small style for errors too
+
+                img1_cell = None
+                try:
+                    img1_path = train_model_image_paths[idx1]
+                    f1 = open(img1_path, 'rb')
+                    opened_files.append(f1)
+                    img1_cell = ReportlabImage(f1, width=1*inch, height=1*inch)
+                except Exception as e:
+                    img1_cell = Paragraph(f"Error (Idx {idx1+1}): {e}", styles["CodeStyle"])
+                   
+                img2_cell = None
+                try:
+                    img2_path = train_model_image_paths[idx2]
+                    f2 = open(img2_path, 'rb')
+                    opened_files.append(f2)
+                    img2_cell = ReportlabImage(f2, width=1*inch, height=1*inch)
+                except Exception as e:
+                    img2_cell = Paragraph(f"Error (Idx {idx2+1}): {e}", styles["CodeStyle"])
+
+                # Determine winner text based on winner_idx (same logic as before)
+                if winner_idx == idx1:
+                    winner_paragraph = Paragraph(f"Image 1 (Idx {idx1+1})", styles["NormalLeft"])
+                elif winner_idx == idx2:
+                    winner_paragraph = Paragraph(f"Image 2 (Idx {idx2+1})", styles["NormalLeft"])
+                else:
+                    winner_paragraph = Paragraph(f"Tie/Error ({final_verdict_text})", styles["NormalLeft"])
+
+                comparison_table_data.append([
+                    f"Comp {idx1+1} vs Comp {idx2+1}",
+                    img1_cell,
+                    img2_cell,
+                    Paragraph(html.escape(final_verdict_text), styles["NormalLeft"]), # Display final verdict
+                    log_paragraph # Add formatted conversation log
+                ])
+
+            # Adjust column widths - make conversation log wider
+            comparison_table = Table(comparison_table_data, colWidths=[1*inch, 1*inch, 1*inch, 1*inch, 3*inch]) 
+            comparison_table.setStyle(TableStyle(comparison_table_style))
+            story.append(comparison_table)
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Force cleanup
+            del comparison_table
+            del comparison_table_data
+
+    # --- Compute Loss (Run Every Iteration) ---
     completion_mask = attention_mask[:, prompt_ids.size(1):]
     loss, loss_metrics = compute_loss(
         all_models["training_model"], all_models["base_model"], prompt_completion_ids, prompt_ids, completion_ids,
         attention_mask, completion_mask, advantages, args
     )
 
-    # Combine metrics
+    # Combine metrics (Original Logic)
     metrics.update(loss_metrics)
 
+    # --- Build PDF and Cleanup ---
+    try:
+        print(f"Building PDF report for round {round_num}...")
+        doc.build(story)
+        print(f"Training report for round {round_num} saved to {pdf_path}")
+    except Exception as e:
+        print(f"ERROR building PDF for round {round_num}: {e}")
+    finally:
+        # Ensure all opened image files are closed
+        print(f"Closing {len(opened_files)} image file handles...")
+        for f in opened_files:
+            try:
+                f.close()
+            except Exception as e_close:
+                print(f"Warning: could not close file handle: {e_close}")
+        del opened_files # Clear the list
+        del story
+        del doc
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # --- Print Memory Usage ---
+    try:
+        with open('/proc/self/status') as f_status:
+            for line in f_status:
+                if line.startswith('VmRSS:'):
+                    rss_kb = int(line.split()[1])
+                    print(f"Current memory usage (RSS): {rss_kb / 1024:.2f} MB")
+                    break
+    except Exception as e_mem:
+        print(f"Could not read memory usage: {e_mem}")
+       
+    # Return loss and metrics (Original Logic)
     return loss, metrics
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
     
     # Model configuration
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name/path of base model")
-    parser.add_argument("--judge_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name of model to use as judge")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-14B", help="Name/path of base model")
+    parser.add_argument("--judge_model_name", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", help="Name of model to use as judge")
     parser.add_argument("--compare_model_name", type=str, default="gpt-4o-mini", help="Name of model to use for comparison")
-    parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate", "ld", "chopped"], help="Dataset to use for training")
-    parser.add_argument("--evaluator", type=str, default="debate", choices=["debate", "ld", "chopped"], help="Evaluator to use for scoring")
+    parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate", "ld", "chopped", "svg"], help="Dataset to use for training")
+    parser.add_argument("--evaluator", type=str, default="debate", choices=["debate", "ld", "chopped", "svg"], help="Evaluator to use for scoring")
 
     # Output and logging
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--save_steps", type=int, default=80, help="Save model every N steps")
+    parser.add_argument("--save_steps", type=int, default=500, help="Save model every N steps")
     parser.add_argument("--eval_iterations", type=int, default=40, help="Number of iterations for evaluation")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
 
@@ -494,17 +841,27 @@ def parse_args():
 
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature")
-    parser.add_argument("--num_chains", type=int, default=16, help="Number of parallel generation chains")
+    parser.add_argument("--num_chains", type=int, default=6, help="Number of parallel generation chains")
+    parser.add_argument("--eval_num_chains", type=int, default=2, help="Number of parallel generation chains for evaluation")
     parser.add_argument("--max_prompt_length", type=int, default=256, help="Maximum prompt length")
-    parser.add_argument("--max_completion_length", type=int, default=786, help="Maximum completion length")
+    parser.add_argument("--max_completion_length", type=int, default=1280, help="Maximum completion length")
 
     # Training parameters
-    parser.add_argument("--num_train_iters", type=int, default=1000, help="Number of training iterations")
+    parser.add_argument("--num_train_iters", type=int, default=6000, help="Number of training iterations")
     parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
     parser.add_argument("--seed", type=int, default=7111994, help="Random seed")
 
     args = parser.parse_args()
     return args
+
+
+def force_gc():
+    """
+    Force aggressive garbage collection to free memory
+    """
+    for _ in range(3):  # Run multiple times to get all generations
+        gc.collect()
+    torch.cuda.empty_cache()
 
 if __name__ == "__main__":
 
@@ -524,7 +881,10 @@ if __name__ == "__main__":
     base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
 
     # Get judge and compare models using the new interfaces
-    judge_model = llms.get_judge_model(args.judge_model_name, device)
+    print(f"Available CUDA devices: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        print(f"Device {i}: {torch.cuda.get_device_name(i)}")
+    judge_model = llms.get_judge_model(args.judge_model_name, "cuda")
     compare_model = llms.get_compare_model(args.compare_model_name, device)
     
     # Simplified all_models dictionary
@@ -542,7 +902,6 @@ if __name__ == "__main__":
 
     ## Set which evaluation criteria to use 
     eval_class = evaluator.get_evaluator(args.evaluator)
-
 
     # Setup logging 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -610,7 +969,9 @@ if __name__ == "__main__":
                 args=args,
                 round_num=round_num
             )
-
+            
+            # Force garbage collection after evaluation
+            force_gc()
             
             # Save metrics to eval log dir
             metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
@@ -630,6 +991,7 @@ if __name__ == "__main__":
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_metrics_total': train_metrics_total
             }, checkpoint_path)
+            
 
         # Slowly update ref model
         if args.update_ref_model and (round_num+1) % args.update_ref_model_freq == 0:
@@ -641,7 +1003,7 @@ if __name__ == "__main__":
         question = next(train_loader)
 
         # Do GRPO - generate chains, score, compute advantage, compute loss 
-        total_loss, train_metrics = grpo_loss(train_loader, all_models, question, eval_class, device, round_num, train_log_dir, args)
+        total_loss, train_metrics = grpo_loss(test_loader, train_loader, all_models, question, eval_class, device, round_num, train_log_dir, args)
         
         # Gradient accumulation
         total_loss = total_loss
@@ -650,7 +1012,7 @@ if __name__ == "__main__":
         scheduler.step()
 
         # Step optimizer
-        if (round_num + 1) % args.gradient_accumulation_steps == 0:
+        if True: #(round_num + 1) % args.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()    
@@ -664,6 +1026,17 @@ if __name__ == "__main__":
         with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:
             json.dump(train_metrics_total, f, indent=4)
 
-        # Add after each major operation in the training loop
+        # Aggressive memory cleanup after each iteration
+        del total_loss
+        del train_metrics
+        gc.collect()
         torch.cuda.empty_cache()
+        
+        # Print memory stats every 10 rounds if verbose
+        if args.verbose and round_num % 10 == 0:
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    print(f"GPU {i} memory allocated: {torch.cuda.memory_allocated(i) / 1024**2:.2f} MB")
+                    print(f"GPU {i} memory reserved: {torch.cuda.memory_reserved(i) / 1024**2:.2f} MB")
+                    print(f"GPU {i} max memory allocated: {torch.cuda.max_memory_allocated(i) / 1024**2:.2f} MB")
     
