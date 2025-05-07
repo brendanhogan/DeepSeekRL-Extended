@@ -52,11 +52,13 @@ def get_judge_model(model_name: str, device: str) -> ModelInterface:
     Returns:
         ModelInterface: The judge model interface
     """
-    if model_name.startswith(('gpt-', 'claude-')):
+    if model_name.startswith(('gpt-', 'claude-', 'o3')):
         if model_name.startswith('gpt-'):
             return OpenAIModel(model_name)
-        else:
+        elif model_name.startswith('claude-'):
             return AnthropicModel(model_name)
+        else:
+            return OpenAIModel(model_name)
     else:
         model, tokenizer = get_llm_tokenizer(model_name, device)
         return HuggingFaceModel(model, tokenizer, device)

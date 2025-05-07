@@ -76,12 +76,12 @@ class OpenAIModel(ModelInterface):
     def generate(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
         # Translate common HF parameters to OpenAI parameters
         openai_kwargs = {}
-        if 'max_new_tokens' in kwargs:
-            openai_kwargs['max_tokens'] = kwargs.pop('max_new_tokens')
-        if 'temperature' in kwargs:
-            openai_kwargs['temperature'] = kwargs.pop('temperature')
-        if 'top_p' in kwargs:
-            openai_kwargs['top_p'] = kwargs.pop('top_p')
+        # if 'max_new_tokens' in kwargs:
+        #     openai_kwargs['max_tokens'] = kwargs.pop('max_new_tokens')
+        # if 'temperature' in kwargs:
+        #     openai_kwargs['temperature'] = kwargs.pop('temperature')
+        # if 'top_p' in kwargs:
+        #     openai_kwargs['top_p'] = kwargs.pop('top_p')
             
         max_retries = 5
         base_delay = 1  # Start with 1 second delay
@@ -94,7 +94,6 @@ class OpenAIModel(ModelInterface):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
-                    **openai_kwargs
                 )
                 return response.choices[0].message.content.strip()
                 

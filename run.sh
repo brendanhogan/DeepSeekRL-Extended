@@ -9,4 +9,6 @@
 # python plotter.py --log_dir "ld_gpt4o_mini_gpt_judge_llama_8b"
 # python plotter.py --log_dir "chopped_gpt4o_mini_gpt_judge_Qwen2.5-7B"
 # python main.py --output_dir "grm_test" --verbose
-python plotter.py --log_dir "grm_test"
+# python main.py --output_dir "grm_test_more_rounds" --verbose
+# python main.py --output_dir "grm_single_round_comedy" --verbose --dataset_name "ld" --evaluator "ld"
+python plotter.py --log_dir "grm_single_round_comedy"

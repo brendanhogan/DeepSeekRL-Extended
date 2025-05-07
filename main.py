@@ -156,10 +156,33 @@ def eval_on_test_set(
                         if "error" in round_detail:
                             f.write(f"    Error: {round_detail['error']}\n")
                             continue
-                        f.write(f"    Principles: {json.dumps(round_detail.get('principles', []))}\n")
-                        f.write(f"    Arg1 Critique: {round_detail.get('arg1_critique', 'N/A')} (Score: {round_detail.get('arg1_score', 'N/A')})\n")
-                        f.write(f"    Arg2 Critique: {round_detail.get('arg2_critique', 'N/A')} (Score: {round_detail.get('arg2_score', 'N/A')})\n")
-                        f.write(f"    Round Winner: {round_detail.get('round_winner', 'N/A')}\n")
+                        f.write(f"    Principles: {json.dumps(round_detail.get('principles', []))}\\n")
+                        
+                        # Handle both debate (arg*) and comedy (bit*) log structures
+                        if 'bit1_critiques_scores' in round_detail: # Comedy Log Structure
+                            bit1_critiques = round_detail.get('bit1_critiques_scores', [])
+                            bit1_agg_score = round_detail.get('bit1_aggregate_score', 'N/A')
+                            # Simple log: Just show aggregate score for brevity in text log
+                            f.write(f"    Bit 1 Critiques (Agg Score: {bit1_agg_score})\\n") 
+                            
+                            bit2_critiques = round_detail.get('bit2_critiques_scores', [])
+                            bit2_agg_score = round_detail.get('bit2_aggregate_score', 'N/A')
+                            f.write(f"    Bit 2 Critiques (Agg Score: {bit2_agg_score})\\n")
+
+                        elif 'arg1_critiques_scores' in round_detail: # Debate Log Structure (assuming similar list structure)
+                            arg1_critiques = round_detail.get('arg1_critiques_scores', [])
+                            arg1_agg_score = round_detail.get('arg1_aggregate_score', 'N/A')
+                            f.write(f"    Argument 1 Critiques (Agg Score: {arg1_agg_score})\\n")
+
+                            arg2_critiques = round_detail.get('arg2_critiques_scores', [])
+                            arg2_agg_score = round_detail.get('arg2_aggregate_score', 'N/A')
+                            f.write(f"    Argument 2 Critiques (Agg Score: {arg2_agg_score})\\n")
+
+                        else: # Fallback or older/different Debate log structure?
+                             f.write(f"    Arg1 Critique: {round_detail.get('arg1_critique', 'N/A')} (Score: {round_detail.get('arg1_score', 'N/A')})\\n")
+                             f.write(f"    Arg2 Critique: {round_detail.get('arg2_critique', 'N/A')} (Score: {round_detail.get('arg2_score', 'N/A')})\\n")
+
+                        f.write(f"    Round Winner: {round_detail.get('round_winner', 'N/A')}\\n")
                 else:
                     # Fallback for older logging or if logs weren't generated
                     trained_model_won = rewards_per_func[i, 0] > 0 # debate_score is index 0
@@ -181,7 +204,6 @@ def eval_on_test_set(
             for k, v in reward_metrics.items():
                 if k.startswith('rewards/'):
                     total_scores[k] += v
-
         # Calculate final metrics
         win_rate = (total_wins / total_comparisons) * 100 if total_comparisons > 0 else 0
         avg_scores = {k: v/num_examples for k,v in total_scores.items()}
@@ -540,7 +562,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=7111994, help="Random seed")
 
     # GRM Evaluation Parameters (added)
-    parser.add_argument("--number_of_inference_rounds", type=int, default=3, help="Number of GRM evaluation rounds per comparison")
+    parser.add_argument("--number_of_inference_rounds", type=int, default=1, help="Number of GRM evaluation rounds per comparison")
     parser.add_argument("--num_principles", type=int, default=3, help="Number of principles to generate per GRM round")
 
     args = parser.parse_args()
@@ -679,7 +701,6 @@ if __name__ == "__main__":
                 win_rate_plot_path=os.path.join(args.output_dir, 'eval_win_rate.png'), # Pass plot path
                 output_pdf_path=pdf_output_path
             )
-
             if args.verbose: print(f"Evaluation complete for round {round_num}. Win rate: {eval_win_rate:.2f}%")
 
         # Save checkpoint

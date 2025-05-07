@@ -181,7 +181,7 @@ def plot_metrics(output_dir):
                     plt.plot(valid_steps, valid_win_rates, color=win_rate_color, linewidth=2.5, marker='D', linestyle='-', label='Win Rate') # Diamond marker
                     plt.xlabel('Training Steps', fontsize=12)
                     plt.ylabel('Evaluation Win Rate (%)', fontsize=12)
-                    plt.title('Qwen2.5-7B vs. gpt-4o-mini Debate Win Rate', pad=20) # Dynamic title
+                    plt.title('Qwen2.5-7B vs. gpt-4o-mini Comedy Win Rate', pad=20) # Dynamic title
                     plt.legend()
                     pdf.savefig(bbox_inches='tight') # Save to combined PDF
                     plt.savefig(win_rate_png_path, bbox_inches='tight') # Save separate PNG

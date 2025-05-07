@@ -163,23 +163,46 @@ class PDF(FPDF):
 
     def add_comparison(self, comparison_data):
         self.add_page()
-        self.chapter_title(f"Comparison #{comparison_data.get('comparison_index', 'N/A')} (Example #{comparison_data.get('example_index', 'N/A')})")
+        # Encode title text
+        title_text = f"Comparison #{comparison_data.get('comparison_index', 'N/A')} (Example #{comparison_data.get('example_index', 'N/A')})"
+        self.chapter_title(title_text.encode('latin-1', 'replace').decode('latin-1'))
 
         self.set_font('Arial', 'B', 10)
-        self.cell(0, 5, f"Topic: {comparison_data.get('topic', 'N/A')}", 0, 1)
+        # Encode topic text
+        topic_text = f"Topic: {comparison_data.get('topic', 'N/A')}"
+        self.cell(0, 5, topic_text.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
         self.ln(2)
 
-        # Arguments
+        # Determine if it's comedy (bit*) or debate (arg*) based on keys
+        is_comedy = 'bit1_trained_extracted' in comparison_data
+        
+        arg1_label = "Bit 1" if is_comedy else "Argument 1"
+        arg2_label = "Bit 2" if is_comedy else "Argument 2"
+        arg1_key_extracted = 'bit1_trained_extracted' if is_comedy else 'argument1_trained_extracted'
+        arg2_key_extracted = 'bit2_compare_extracted' if is_comedy else 'argument2_compare_extracted'
+        arg1_key_agg_score = 'bit1_aggregate_score' if is_comedy else 'arg1_aggregate_score'
+        arg2_key_agg_score = 'bit2_aggregate_score' if is_comedy else 'arg2_aggregate_score'
+        arg1_key_critiques = 'bit1_critiques_scores' if is_comedy else 'arg1_critiques_scores'
+        arg2_key_critiques = 'bit2_critiques_scores' if is_comedy else 'arg2_critiques_scores'
+
+
+        # Arguments/Bits
         self.set_font('Arial', 'BI', 10)
-        self.cell(0, 5, "Argument 1 (Trained Model - Extracted):", 0, 1)
+        # Encode argument/bit label
+        arg1_header = f"{arg1_label} (Trained Model - Extracted):"
+        self.cell(0, 5, arg1_header.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
         self.set_font('Arial', '', 9) 
-        self.multi_cell(0, 5, comparison_data.get('argument1_trained_extracted', 'N/A'))
+        # Encode argument/bit text
+        arg1_text = clean_spaces_preserve_newlines(comparison_data.get(arg1_key_extracted, 'N/A'))
+        self.multi_cell(0, 5, arg1_text.encode('latin-1', 'replace').decode('latin-1'))
         self.ln(1)
         
         self.set_font('Arial', 'BI', 10)
-        self.cell(0, 5, "Argument 2 (Compare Model - Extracted):", 0, 1)
+        arg2_header = f"{arg2_label} (Compare Model - Extracted):"
+        self.cell(0, 5, arg2_header.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
         self.set_font('Arial', '', 9) 
-        self.multi_cell(0, 5, comparison_data.get('argument2_compare_extracted', 'N/A'))
+        arg2_text = clean_spaces_preserve_newlines(comparison_data.get(arg2_key_extracted, 'N/A'))
+        self.multi_cell(0, 5, arg2_text.encode('latin-1', 'replace').decode('latin-1'))
         self.ln(3)
 
         # Rounds
@@ -188,11 +211,13 @@ class PDF(FPDF):
         self.ln(1)
         for round_detail in comparison_data.get('rounds', []):
             self.set_font('Arial', 'B', 10)
-            self.cell(0, 5, f"  Round {round_detail.get('round', 'N/A')}", 0, 1)
+            round_header = f"  Round {round_detail.get('round', 'N/A')}"
+            self.cell(0, 5, round_header.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
             
             if "error" in round_detail:
                 self.set_font('Arial', 'I', 9)
-                self.cell(0, 5, f"    Error: {round_detail['error']}", 0, 1)
+                error_text = f"    Error: {round_detail['error']}"
+                self.cell(0, 5, error_text.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
                 continue
 
             # Principles
@@ -201,39 +226,60 @@ class PDF(FPDF):
             self.set_font('Arial', '', 9)
             principles = round_detail.get('principles', [])
             for i, p in enumerate(principles):
-                self.multi_cell(0, 5, f"      {i+1}. {p}")
+                principle_text = clean_spaces_preserve_newlines(f"      {i+1}. {p}") 
+                self.multi_cell(0, 5, principle_text.encode('latin-1', 'replace').decode('latin-1'))
             self.ln(1)
 
-            # Arg1 Critiques/Scores
+            # Arg1/Bit1 Critiques/Scores
             self.set_font('Arial', 'BI', 9)
-            self.cell(0, 5, f"    Argument 1 Critiques (Agg Score: {round_detail.get('arg1_aggregate_score', 'N/A')}):", 0, 1)
+            agg_score1 = round_detail.get(arg1_key_agg_score, 'N/A')
+            critique1_header = f"    {arg1_label} Critiques (Agg Score: {agg_score1}):"
+            self.cell(0, 5, critique1_header.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
             self.set_font('Arial', '', 9)
-            critiques1 = round_detail.get('arg1_critiques_scores', [])
-            for c in critiques1:
-                 self.multi_cell(0, 5, f"      Principle: {c.get('principle', 'N/A')}")
-                 self.multi_cell(0, 5, f"      Critique: {c.get('critique', 'N/A')}")
-                 self.multi_cell(0, 5, f"      Score: {c.get('score', 'N/A')}")
+            critiques1 = round_detail.get(arg1_key_critiques, [])
+            if not critiques1: 
+                 self.multi_cell(0, 5, "      N/A")
                  self.ln(1)
+            else:
+                for c in critiques1:
+                     principle_line = f"      Principle: {clean_spaces_preserve_newlines(c.get('principle', 'N/A'))}"
+                     critique_line = f"      Critique: {clean_spaces_preserve_newlines(c.get('critique', 'N/A'))}"
+                     score_line = f"      Score: {c.get('score', 'N/A')}"
+                     self.multi_cell(0, 5, principle_line.encode('latin-1', 'replace').decode('latin-1'))
+                     self.multi_cell(0, 5, critique_line.encode('latin-1', 'replace').decode('latin-1'))
+                     self.multi_cell(0, 5, score_line.encode('latin-1', 'replace').decode('latin-1'))
+                     self.ln(1)
 
-            # Arg2 Critiques/Scores
+            # Arg2/Bit2 Critiques/Scores
             self.set_font('Arial', 'BI', 9)
-            self.cell(0, 5, f"    Argument 2 Critiques (Agg Score: {round_detail.get('arg2_aggregate_score', 'N/A')}):", 0, 1)
+            agg_score2 = round_detail.get(arg2_key_agg_score, 'N/A')
+            critique2_header = f"    {arg2_label} Critiques (Agg Score: {agg_score2}):"
+            self.cell(0, 5, critique2_header.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
             self.set_font('Arial', '', 9)
-            critiques2 = round_detail.get('arg2_critiques_scores', [])
-            for c in critiques2:
-                 self.multi_cell(0, 5, f"      Principle: {c.get('principle', 'N/A')}")
-                 self.multi_cell(0, 5, f"      Critique: {c.get('critique', 'N/A')}")
-                 self.multi_cell(0, 5, f"      Score: {c.get('score', 'N/A')}")
+            critiques2 = round_detail.get(arg2_key_critiques, [])
+            if not critiques2: 
+                 self.multi_cell(0, 5, "      N/A")
                  self.ln(1)
+            else:
+                for c in critiques2:
+                     principle_line = f"      Principle: {clean_spaces_preserve_newlines(c.get('principle', 'N/A'))}"
+                     critique_line = f"      Critique: {clean_spaces_preserve_newlines(c.get('critique', 'N/A'))}"
+                     score_line = f"      Score: {c.get('score', 'N/A')}"
+                     self.multi_cell(0, 5, principle_line.encode('latin-1', 'replace').decode('latin-1'))
+                     self.multi_cell(0, 5, critique_line.encode('latin-1', 'replace').decode('latin-1'))
+                     self.multi_cell(0, 5, score_line.encode('latin-1', 'replace').decode('latin-1'))
+                     self.ln(1)
 
             # Round Winner
             self.set_font('Arial', 'B', 10)
-            self.cell(0, 5, f"    Round Winner: {round_detail.get('round_winner', 'N/A')}", 0, 1)
+            round_winner_text = f"    Round Winner: {round_detail.get('round_winner', 'N/A')}"
+            self.cell(0, 5, round_winner_text.encode('latin-1', 'replace').decode('latin-1'), 0, 1)
             self.ln(2) # Space between rounds
         
         # Overall Winner
         self.set_font('Arial', 'B', 11)
-        self.cell(0, 6, f"Overall Winner: {comparison_data.get('overall_winner', 'N/A')}", 0, 1)
+        overall_winner_text = f"Overall Winner: {comparison_data.get('overall_winner', 'N/A')}"
+        self.cell(0, 6, overall_winner_text.encode('latin-1', 'replace').decode('latin-1'), 0, 1) 
         self.ln(2)
 
 def create_evaluation_pdf(
