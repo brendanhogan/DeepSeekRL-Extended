@@ -14,13 +14,16 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as Pl
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.enums import TA_JUSTIFY
 from reportlab.lib import colors
-from PIL import Image as PILImage # To avoid conflict with ReportLabImage
+from PIL import Image as PILImage, ImageDraw # To avoid conflict with ReportLabImage, explicitly import ImageDraw
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from qwen_vl_utils import process_vision_info
 
 import evaluator
 from gui_generator import GUIGenerator # For plot_predictions type hint if GUI specific logic
+
+# Import constants from captcha_generator if needed for plotting logic
+from captcha_generator import FINAL_DIM as CAPTCHA_FINAL_DIM, GRID_SIZE as CAPTCHA_GRID_SIZE, BANNER_ABS_HEIGHT as CAPTCHA_BANNER_ABS_HEIGHT, PADDING_SIZE as CAPTCHA_PADDING_SIZE, CELL_DIM as CAPTCHA_CELL_DIM
 
 MAX_COMPLETIONS_PER_PAGE_PDF = 2
 MAX_PROMPT_LENGTH_PDF = 300 # Add the missing constant definition
@@ -251,8 +254,35 @@ def _add_example_header_to_pdf(story: list, styles: dict, image_path: str,
                 display_height = 3.5 * inch
                 display_width = display_height / aspect
             
+            # For CAPTCHA, add a header before the input image
+            if dataset_type == 'captcha':
+                story.append(Paragraph("<b>Input CAPTCHA Image:</b>", styles['BodyText']))
+            
             story.append(PlatypusImage(image_path, width=display_width, height=display_height))
             story.append(Spacer(1, 0.1*inch))
+            
+            # For CAPTCHA, also display the solution image if available
+            if dataset_type == 'captcha' and answer_data and 'solution_image_path' in answer_data:
+                solution_image_path = answer_data['solution_image_path']
+                if os.path.exists(solution_image_path):
+                    try:
+                        story.append(Paragraph("<b>Ground Truth Solution Image:</b>", styles['BodyText']))
+                        sol_img = PILImage.open(solution_image_path)
+                        sol_img_width, sol_img_height = sol_img.size
+                        sol_aspect = sol_img_height / float(sol_img_width)
+                        sol_display_width = 2.5 * inch
+                        sol_display_height = sol_display_width * sol_aspect
+                        if sol_display_height > 3.5 * inch:
+                            sol_display_height = 3.5 * inch
+                            sol_display_width = sol_display_height / sol_aspect
+                        
+                        story.append(PlatypusImage(solution_image_path, width=sol_display_width, height=sol_display_height))
+                        story.append(Spacer(1, 0.1*inch))
+                    except Exception as e:
+                        story.append(Paragraph(f"Error loading solution image: {solution_image_path}. Error: {e}", styles['BodyText']))
+                else:
+                    story.append(Paragraph(f"Solution image not found: {solution_image_path}", styles['BodyText']))
+                    
         except Exception as e:
             story.append(Paragraph(f"Error loading image: {image_path}. Error: {e}", styles['BodyText']))
     else:
@@ -269,6 +299,12 @@ def _add_example_header_to_pdf(story: list, styles: dict, image_path: str,
         target_bbox = answer_data.get('bounding_box', 'N/A')
         story.append(Paragraph(f"<b>Target Object:</b> {target_name}", styles['BodyText']))
         story.append(Paragraph(f"<b>Target BBox:</b> {str(target_bbox)}", styles['BodyText']))
+    elif dataset_type == 'captcha':
+        target_class_name = answer_data.get('target_class_name', 'N/A')
+        article = "an" if target_class_name.lower()[0] in 'aeiou' else "a"
+        story.append(Paragraph(f"<b>Target:</b> Select all squares with {article} {target_class_name}", styles['BodyText']))
+        # Optionally, display the boolean list or a simple text representation if helpful
+        # story.append(Paragraph(f"<b>Target Squares (boolean):</b> {str(answer_data.get('target_squares_boolean'))}", styles['Code']))
     else: # Clock, Correlation
         story.append(Paragraph(f"<b>Ground Truth Answer:</b> {_truncate_text(str(answer_data), MAX_ANSWER_LENGTH_PDF)}", styles['BodyText']))
     story.append(Spacer(1, 0.2*inch))
@@ -276,7 +312,8 @@ def _add_example_header_to_pdf(story: list, styles: dict, image_path: str,
 def _add_completion_to_pdf(story: list, styles: dict, completion_text: str, 
                            metrics: Optional[Dict[str, Any]], completion_idx: int, 
                            dataset_type: str,
-                           image_path_for_completion_pdf: Optional[str] = None): 
+                           image_path_for_completion_pdf: Optional[str] = None,
+                           captcha_data: Optional[Dict[str, Any]] = None): 
     story.append(Paragraph(f"Completion {completion_idx + 1}", styles['h3']))
 
     # Display image for this completion (e.g., with click for GUI)
@@ -314,9 +351,42 @@ def _add_completion_to_pdf(story: list, styles: dict, completion_text: str,
     story.append(Paragraph(html.escape(answer) if answer else "<i>N/A</i>", styles['Code']))
     story.append(Spacer(1, 0.1*inch))
 
+    # Add CAPTCHA-specific plain English explanation if dataset_type is 'captcha' and captcha_data is provided
+    if dataset_type == 'captcha' and captcha_data is not None:
+        true_positives = captcha_data.get('true_positives', 0)
+        false_positives = captcha_data.get('false_positives', 0)
+        false_negatives = captcha_data.get('false_negatives', 0)
+        total_targets = captcha_data.get('total_targets', 0)
+        total_clicks = captcha_data.get('total_clicks', 0)
+        
+        # Create plain English explanation
+        accuracy_text = [
+            f"<b>CAPTCHA Accuracy Summary:</b>",
+            f"• Model clicked {true_positives} out of {total_targets} correct targets ({true_positives/total_targets*100:.1f}% recall)" if total_targets > 0 else "• No correct targets to click",
+            f"• Model made {total_clicks} total clicks",
+        ]
+        
+        if false_positives > 0:
+            accuracy_text.append(f"• Overclicked by {false_positives} (clicked {false_positives} incorrect squares)")
+        
+        if false_negatives > 0:
+            accuracy_text.append(f"• Missed {false_negatives} correct targets")
+            
+        # Add precision information
+        if total_clicks > 0:
+            precision = true_positives / total_clicks
+            accuracy_text.append(f"• Precision: {precision*100:.1f}% of clicks were on correct targets")
+            
+        # Join with line breaks and add to PDF
+        story.append(Paragraph("<br/>".join(accuracy_text), styles['BodyText']))
+    story.append(Spacer(1, 0.1*inch))
+
     if metrics:
         # Create a more structured table for metrics if many, or simple paragraphs
         metrics_data = [["Metric", "Value"]]
+        # Retrieve total_reward_this_completion from metrics if it exists
+        total_reward_val = metrics.pop('total_reward_this_completion', None) 
+
         for name, value in metrics.items():
             # Optionally shorten name for display
             display_name = name.replace("rewards/", "").replace("metrics/", "")
@@ -324,6 +394,9 @@ def _add_completion_to_pdf(story: list, styles: dict, completion_text: str,
                 metrics_data.append([display_name, f"{value:.4f}"])
             else:
                 metrics_data.append([display_name, str(value)])
+        
+        if total_reward_val is not None:
+             metrics_data.append(["Total Reward (this completion)", f"{total_reward_val:.4f}"])
         
         if len(metrics_data) > 1:
              # Adjusted colWidths: more space for metric name
@@ -353,18 +426,15 @@ def _process_single_completion_for_eval(
     dataset_type: str = 'gui',
     original_image_path: Optional[str] = None,
     vis_image_path_for_pdf: Optional[str] = None,
-    gui_plotter: Optional[callable] = None
+    gui_plotter: Optional[callable] = None,
+    verbose: bool = False # Added verbose for plot_captcha_evaluation
 ) -> Optional[dict[str, float]]:
     """
     Processes a single completion text for evaluation and optionally adds it to a PDF story.
     Returns a dictionary of metric scores for this single completion.
     """
-    if dataset_type == 'gui':
-        # For GUI, answer_data is the target_details_dict
-        # The evaluator's compute_rewards expects a list of answers.
-        # For a single completion, we wrap answer_data in a list.
+    if dataset_type == 'gui' or dataset_type == 'captcha': # Captcha also uses dict answer_data
         current_answers_list = [answer_data]
-        # The evaluator also expects completions in a specific nested list structure.
         current_completions_list = [[{'content': completion_text}]]
     else: # clock, correlation
         # For clock/correlation, answer_data is the answer string.
@@ -407,11 +477,12 @@ def _process_single_completion_for_eval(
     if story is not None and styles is not None:
         reward_breakdown_for_pdf = eval_class.get_reward_breakdown(reward_scores_for_breakdown)
         
-        # Add raw completion and its detailed scores to the PDF
-        # This was the problematic part: _add_completion_to_pdf
-        # It needs image handling as well if it's a GUI task for visualization
+        # Add total_reward_single to the dictionary that will be passed as metrics to _add_completion_to_pdf
+        reward_breakdown_for_pdf['total_reward_this_completion'] = total_reward_single
         
         img_path_for_pdf_entry = None
+        captcha_stats = None
+        
         if dataset_type == 'gui' and original_image_path and vis_image_path_for_pdf and gui_plotter:
             try:
                 # Plot click for GUI task if a plotter is provided
@@ -438,26 +509,100 @@ def _process_single_completion_for_eval(
                 if verbose: # Assuming verbose is accessible or passed
                     print(f"  Warning: Error plotting click for PDF (utils): {plot_err}")
                 img_path_for_pdf_entry = original_image_path # Fallback
+        elif dataset_type == 'captcha' and original_image_path and vis_image_path_for_pdf:
+            # CAPTCHA specific PDF logging for evaluation
+            img_path_for_pdf_entry = None
+            
+            # Create a temporary CaptchaEvaluator to extract clicks
+            from evaluator import CaptchaEvaluator
+            temp_captcha_evaluator = CaptchaEvaluator()
+            predicted_clicks = temp_captcha_evaluator._extract_click_calls(completion_text)
+            
+            # Calculate CAPTCHA accuracy stats for the plain English summary
+            if 'target_squares_boolean' in answer_data:
+                target_squares_boolean = answer_data['target_squares_boolean']
+                total_targets = sum(1 for x in target_squares_boolean if x)
+                total_clicks = len(predicted_clicks)
+                
+                # Manually calculate TP, FP, FN for clarity
+                tp = 0  # True positives
+                fp = 0  # False positives
+                clicked_squares = set()
+                
+                # For each click, determine which square it falls in and if it's a target
+                for px, py in predicted_clicks:
+                    # Convert pixel coordinates to grid cell
+                    # Calculate grid parameters using constants from CAPTCHA generator
+                    content_width_unpadded = CAPTCHA_CELL_DIM * CAPTCHA_GRID_SIZE
+                    content_height_unpadded = CAPTCHA_BANNER_ABS_HEIGHT + content_width_unpadded
+                    pre_resize_width = content_width_unpadded + 2 * CAPTCHA_PADDING_SIZE
+                    pre_resize_height = content_height_unpadded + 2 * CAPTCHA_PADDING_SIZE
+                    scale_x = CAPTCHA_FINAL_DIM / pre_resize_width
+                    scale_y = CAPTCHA_FINAL_DIM / pre_resize_height
+                    final_grid_start_x = CAPTCHA_PADDING_SIZE * scale_x
+                    final_grid_start_y = (CAPTCHA_PADDING_SIZE + CAPTCHA_BANNER_ABS_HEIGHT) * scale_y
+                    final_cell_width = CAPTCHA_CELL_DIM * scale_x
+                    final_cell_height = CAPTCHA_CELL_DIM * scale_y
+                    
+                    # Determine grid position
+                    if (px < final_grid_start_x or py < final_grid_start_y or 
+                        px >= final_grid_start_x + final_cell_width * CAPTCHA_GRID_SIZE or 
+                        py >= final_grid_start_y + final_cell_height * CAPTCHA_GRID_SIZE):
+                        # Click is outside the grid
+                        fp += 1
+                        continue
+                    
+                    # Calculate which cell was clicked
+                    col = int((px - final_grid_start_x) / final_cell_width)
+                    row = int((py - final_grid_start_y) / final_cell_height)
+                    col = max(0, min(col, CAPTCHA_GRID_SIZE - 1))
+                    row = max(0, min(row, CAPTCHA_GRID_SIZE - 1))
+                    
+                    square_idx = row * CAPTCHA_GRID_SIZE + col
+                    
+                    # Only count unique square clicks (first click per square)
+                    if square_idx not in clicked_squares:
+                        clicked_squares.add(square_idx)
+                        # Check if it's a target square
+                        if square_idx < len(target_squares_boolean) and target_squares_boolean[square_idx]:
+                            tp += 1
+                        else:
+                            fp += 1
+                
+                # Calculate false negatives (missed targets)
+                fn = total_targets - tp
+                
+                # Store the stats for the plain English explanation
+                captcha_stats = {
+                    'true_positives': tp,
+                    'false_positives': fp,
+                    'false_negatives': fn,
+                    'total_targets': total_targets,
+                    'total_clicks': total_clicks
+                }
+            
+            # Plot the visualization with the clicks
+            plot_captcha_evaluation(
+                base_image_path=original_image_path,
+                predicted_clicks=predicted_clicks,
+                target_squares_boolean=answer_data['target_squares_boolean'],
+                output_path=vis_image_path_for_pdf,
+                verbose=verbose)
+            img_path_for_pdf_entry = vis_image_path_for_pdf
+                
         elif dataset_type != 'gui' and original_image_path:
              img_path_for_pdf_entry = original_image_path
 
-
+        # Add the completion to the PDF with the appropriate image and CAPTCHA stats
         _add_completion_to_pdf(
             story, styles, completion_text, 
-            reward_breakdown_for_pdf, # Pass the breakdown
-            total_reward_single, # Pass the total reward for this completion
-            completion_idx,
-            # image_path_for_completion_pdf=img_path_for_pdf_entry # Add this if _add_completion_to_pdf supports it
-            # For now, _add_completion_to_pdf from snippet doesn't take image path directly for completion.
-            # It's usually added in _add_example_header_to_pdf.
-            # If you want image per completion, _add_completion_to_pdf needs an update.
+            metrics=reward_breakdown_for_pdf, # Pass the breakdown as metrics
+            completion_idx=completion_idx,
+            dataset_type=dataset_type,
+            image_path_for_completion_pdf=img_path_for_pdf_entry, # Pass the plotted image
+            captcha_data=captcha_stats # Pass the captcha statistics
         )
         
-        # Add PageBreak if needed (e.g., after every N completions)
-        # This logic might be better placed in the calling function (e.g., eval_on_test_set)
-        # as it depends on how many completions are processed per example.
-        # if (completion_idx + 1) % MAX_COMPLETIONS_PER_PAGE_PDF == 0:
-        # story.append(PageBreak())
     # --- End PDF Logging Section ---
 
     return processed_metrics_for_return
@@ -498,6 +643,7 @@ def _add_training_completion_to_pdf(story: list, styles: dict,
                                     reward_breakdown: Dict[str, float], 
                                     advantage: float, 
                                     completion_idx: int, 
+                                    dataset_type: str, # Added dataset_type for consistency
                                     image_path_for_completion_pdf: Optional[str] = None):
     """Adds details for a single training completion (including scores and advantage) to the PDF story."""
     story.append(Paragraph(f"Training Completion {completion_idx + 1}", styles['h3']))
@@ -550,6 +696,27 @@ def _add_training_completion_to_pdf(story: list, styles: dict,
     ]))
     story.append(table)
     story.append(Spacer(1, 0.15*inch))
+
+def plot_captcha_evaluation(
+    base_image_path: str,
+    predicted_clicks: list[tuple[int, int]],
+    target_squares_boolean: list[bool],
+    output_path: str,
+    verbose: bool = False
+) -> bool:
+    """Just plots X's where the model clicked."""
+    img = PILImage.open(base_image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    
+    # Draw an X for each click
+    for x, y in predicted_clicks:
+        # Draw X with fixed size
+        size = 10
+        draw.line([(x - size, y - size), (x + size, y + size)], fill=(255, 0, 0), width=3)
+        draw.line([(x + size, y - size), (x - size, y + size)], fill=(255, 0, 0), width=3)
+    
+    img.save(output_path)
+    return True
 
 
 

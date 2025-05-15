@@ -9,6 +9,7 @@ from matplotlib.ticker import MaxNLocator
 import re
 from collections import defaultdict
 from typing import Optional # Added for type hinting
+import shutil
 
 def moving_average(data, window_size=5):
     """Calculate moving average with given window size"""
@@ -43,7 +44,7 @@ def apply_retro_futurism_style(ax, fig, line_color):
     return line_color
 
 def plot_metric(metric_name, rounds, values, output_path, line_color_hex, claude_score: Optional[float] = None):
-    """Plots a single metric over rounds and saves it as a PNG, optionally adding a Claude score line."""
+    """Plots a single metric over rounds and saves it as a PNG."""
     global text_color, bg_color, grid_color # Ensure access to global style vars
 
     print(f"Plotting {metric_name}...")
@@ -67,10 +68,6 @@ def plot_metric(metric_name, rounds, values, output_path, line_color_hex, claude
 
     ax.fill_between(rounds, values, color=actual_line_color, alpha=0.1, zorder=1)
     
-    # Add Claude's score as a horizontal line if provided
-    if claude_score is not None:
-        ax.axhline(y=claude_score, color='#FFD700', linestyle='--', linewidth=2.5, label='Claude Sonnet 3.7 Level', zorder=15) # Gold color, slightly thicker
-
     try:
         plt.rcParams['font.family'] = 'Consolas'
     except:
@@ -113,27 +110,12 @@ def create_plots():
     bg_color = '#212946'
     grid_color = '#2A3459'
 
-    json_reports_dir = "gui_testing_hard/eval_logs/json_reports/"
-    plots_output_dir = "gui_plots/"
-    claude_eval_json_path = "claude_gui_eval_results/claude_eval.json"
+    json_reports_dir = "captcha_run_full_f1only/eval_logs/json_reports/"
+    plots_output_dir = "captcha_plots/"
 
     if not os.path.exists(plots_output_dir):
         os.makedirs(plots_output_dir)
         print(f"Created directory: {plots_output_dir}")
-
-    # Load Claude's evaluation scores
-    claude_scores_data = {}
-    if os.path.exists(claude_eval_json_path):
-        try:
-            with open(claude_eval_json_path, 'r') as f:
-                claude_scores_data = json.load(f)
-            print(f"Successfully loaded Claude scores from {claude_eval_json_path}")
-        except json.JSONDecodeError:
-            print(f"Error decoding JSON from {claude_eval_json_path}. Claude scores will not be plotted.")
-        except Exception as e:
-            print(f"Error loading Claude scores from {claude_eval_json_path}: {e}. Claude scores will not be plotted.")
-    else:
-        print(f"Warning: Claude scores file not found at {claude_eval_json_path}. Claude lines will not be plotted.")
 
     all_metrics_data = defaultdict(lambda: {'rounds': [], 'values': []})
     json_files = [f for f in os.listdir(json_reports_dir) if f.startswith('average_scores_round_') and f.endswith('.json')]
@@ -180,13 +162,7 @@ def create_plots():
         output_path = os.path.join(plots_output_dir, output_filename)
         current_line_color = line_colors[i % len(line_colors)]
         
-        # Get Claude's score for the current metric
-        claude_value_for_metric = claude_scores_data.get(metric_name)
-        if claude_value_for_metric is not None and not isinstance(claude_value_for_metric, (int, float)):
-            print(f"Warning: Claude score for '{metric_name}' is not a number: {claude_value_for_metric}. Not plotting Claude line.")
-            claude_value_for_metric = None
-            
-        plot_metric(metric_name, data['rounds'], data['values'], output_path, current_line_color, claude_score=claude_value_for_metric)
+        plot_metric(metric_name, data['rounds'], data['values'], output_path, current_line_color)
 
 def plot_metrics(output_dir):
     """
@@ -227,8 +203,15 @@ def plot_metrics(output_dir):
     plt.style.use('bmh')  # Using 'bmh' style which is a modern, clean style
     colors = ['#2ecc71', '#e74c3c', '#3498db', '#f1c40f', '#9b59b6', '#1abc9c', '#e67e22', '#34495e']
     
+    # Ensure eval_logs/pdfs directory exists
+    eval_pdfs_dir = os.path.join(output_dir, 'eval_logs', 'pdfs')
+    os.makedirs(eval_pdfs_dir, exist_ok=True)
+    print(f"Created directory: {eval_pdfs_dir}")
+    
     # Create PDF to save all plots
     pdf_path = os.path.join(output_dir, 'training_plots.pdf')
+    pdf_copy_path = os.path.join(eval_pdfs_dir, 'training_plots.pdf')
+    
     with PdfPages(pdf_path) as pdf:
         
         # --- Plot Training Metrics ---
@@ -427,6 +410,10 @@ def plot_metrics(output_dir):
                              png_path = os.path.join(output_dir, "evaluation_mean_abs_correlation_error.png")
                              plt.savefig(png_path, bbox_inches='tight')
                              print(f"Saved specific plot: {png_path}")
+                        elif plot_title == "Metrics - F1 Score": # Added for F1 Score
+                             png_path = os.path.join(output_dir, "evaluation_f1_score.png")
+                             plt.savefig(png_path, bbox_inches='tight')
+                             print(f"Saved specific plot: {png_path}")
                         # --- End save specific plots ---
 
                         plt.close()
@@ -436,6 +423,13 @@ def plot_metrics(output_dir):
              print("No evaluation logs found or processed. Skipping evaluation plots.")
 
     print(f"Plots saved to {pdf_path}")
+    
+    # Copy the PDF to eval_logs/pdfs directory
+    try:
+        shutil.copy2(pdf_path, pdf_copy_path)
+        print(f"Also copied plots to {pdf_copy_path}")
+    except Exception as e:
+        print(f"Error copying PDF to eval_logs/pdfs directory: {e}")
 
 
 if __name__ == "__main__":

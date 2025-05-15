@@ -69,6 +69,8 @@ def eval_on_test_set(
         main_error_metric_key_for_return = 'metrics/mean_abs_error_seconds'
     elif args.dataset_type == 'gui':
         main_error_metric_key_for_return = 'metrics/mean_distance_to_center_error' # Or click_hit_rate if preferred
+    elif args.dataset_type == 'captcha':
+        main_error_metric_key_for_return = 'metrics/f1_score' # Or reward, or recall_percent_correct_squares
     else:
         main_error_metric_key_for_return = 'reward' # Fallback, should be defined
 
@@ -79,7 +81,12 @@ def eval_on_test_set(
             prompt_to_use = target_details_dict['dynamic_prompt']
             answer_for_eval_and_pdf = target_details_dict
             is_hard_example = target_details_dict.get('is_hard', False) # Get the flag
-        else:
+        elif args.dataset_type == 'captcha':
+            img_path, answer_data_dict = batch
+            prompt_to_use = answer_data_dict['dynamic_prompt']
+            answer_for_eval_and_pdf = answer_data_dict # Pass the whole dict
+            is_hard_example = False # No hard mode for captcha yet
+        else: # clock, correlation
             img_path, answer_string = batch
             prompt_to_use = test_loader.prompt # Static prompt for clock/correlation
             answer_for_eval_and_pdf = answer_string
@@ -136,7 +143,6 @@ def eval_on_test_set(
                             aggregated_metrics_sum_normal[metric_name] += value
                         elif torch.is_tensor(value) and value.numel() == 1:
                             aggregated_metrics_sum_normal[metric_name] += value.item()
-        
         num_examples += 1
 
     # --- Calculate final averages --- 
@@ -306,6 +312,16 @@ def score_completions(
         }
         # The `answers` expected by GUIEvaluator.compute_rewards is a list of these answer_data dicts
         eval_answers_list = [answer_data] * len(completions_text)
+    elif args.dataset_type == 'captcha':
+        # prompt_data is the answer_data_dict from PreGeneratedCaptchaLoader
+        # answer_data is also the answer_data_dict
+        log_data['prompt'] = {
+            'text': prompt_data['dynamic_prompt'],
+            'target_class_name': answer_data['target_class_name'],
+            'target_squares_boolean': answer_data['target_squares_boolean'],
+            'image_path': image_path
+        }
+        eval_answers_list = [answer_data] * len(completions_text)
     else:
         # prompt_data is the static prompt string
         # answer_data is the single answer string (time or R value)
@@ -439,6 +455,11 @@ def grpo_loss(
         # answer_details_or_string is also target_details_dict
         current_prompt_text = prompt_info_or_static_prompt['dynamic_prompt']
         current_answer_data = answer_details_or_string # This is the dict for GUIEvaluator
+    elif args.dataset_type == 'captcha':
+        # prompt_info_or_static_prompt is the answer_data_dict from PreGeneratedCaptchaLoader
+        # answer_details_or_string is also the answer_data_dict
+        current_prompt_text = prompt_info_or_static_prompt['dynamic_prompt']
+        current_answer_data = answer_details_or_string # This is the dict for CaptchaEvaluator
     else:
         current_prompt_text = prompt_info_or_static_prompt
         current_answer_data = answer_details_or_string # This is the string for Clock/Corr
@@ -484,7 +505,7 @@ def parse_args():
     
     # Model configuration
     parser.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", help="Model identifier for main and base model")
-    parser.add_argument("--dataset_type", type=str, default="clock", choices=["clock", "correlation", "gui"], help="Type of dataset to use ('clock', 'correlation', or 'gui')")
+    parser.add_argument("--dataset_type", type=str, default="clock", choices=["clock", "correlation", "gui", "captcha"], help="Type of dataset to use ('clock', 'correlation', 'gui', or 'captcha')")
 
     # Output and logging
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
@@ -629,7 +650,12 @@ if __name__ == "__main__":
                     ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
 
         # --- Training Step --- (Run every round)
-        batch = next(train_loader)
+        try:
+            batch = next(train_loader)
+        except StopIteration:
+            train_loader.reset()  # Reset the loader when we reach the end
+            batch = next(train_loader)  # Get the first batch after reset
+            
         img_path, data_for_grpo = batch 
 
         # Perform GRPO step and get data needed for potential PDF logging
@@ -687,6 +713,9 @@ if __name__ == "__main__":
             if args.dataset_type == 'gui':
                 prompt_text_for_pdf = log_data['prompt_info']['dynamic_prompt']
                 answer_data_for_pdf = log_data['prompt_info'] # The dict itself
+            elif args.dataset_type == 'captcha':
+                prompt_text_for_pdf = log_data['prompt_info']['dynamic_prompt']
+                answer_data_for_pdf = log_data['prompt_info'] # The dict from PreGeneratedCaptchaLoader
             else:
                 prompt_text_for_pdf = log_data['prompt_info'] # The static prompt string
                 answer_data_for_pdf = log_data['prompt_info'] # The answer string (same as prompt_info here)
@@ -730,13 +759,28 @@ if __name__ == "__main__":
                                 img_path_for_pdf_entry = vis_train_img_path
                             else:
                                 img_path_for_pdf_entry = log_data['img_path'] # Use original if click not parsed
-                        else: 
+                        else: # Not a GUIEvaluator, so no specific click plotting for training PDF
                             img_path_for_pdf_entry = log_data['img_path']
                     except Exception as plot_err:
                         print(f"  Warning: Error plotting training click for PDF (Round {round_num}, Comp {compl_idx}): {plot_err}")
                         img_path_for_pdf_entry = log_data['img_path']
+                elif args.dataset_type == 'captcha':
+                    # Create a temporary CaptchaEvaluator to extract clicks
+                    from evaluator import CaptchaEvaluator
+                    temp_captcha_evaluator = CaptchaEvaluator()
+                    predicted_clicks = temp_captcha_evaluator._extract_click_calls(completion_text)
+                    
+                    # Plot the visualization with the clicks
+                    utils.plot_captcha_evaluation(
+                        base_image_path=log_data['img_path'],
+                        predicted_clicks=predicted_clicks,
+                        target_squares_boolean=log_data['prompt_info']['target_squares_boolean'],
+                        output_path=vis_train_img_path,
+                        verbose=False
+                    )
+                    img_path_for_pdf_entry = vis_train_img_path
                 else:
-                    img_path_for_pdf_entry = log_data['img_path'] # Use original image for non-GUI tasks
+                    img_path_for_pdf_entry = log_data['img_path'] # Use original image for non-GUI/non-CAPTCHA tasks
 
                 # Add completion details to story
                 utils._add_training_completion_to_pdf(
@@ -746,6 +790,7 @@ if __name__ == "__main__":
                     reward_breakdown=reward_breakdown,
                     advantage=advantage,
                     completion_idx=compl_idx,
+                    dataset_type=args.dataset_type,
                     image_path_for_completion_pdf=img_path_for_pdf_entry
                 )
                 # Add PageBreak if needed (e.g., after every 2 completions)
@@ -784,4 +829,3 @@ if __name__ == "__main__":
 
         # Add after each major operation in the training loop
         torch.cuda.empty_cache()
-       

@@ -89,8 +89,10 @@ def get_evaluator(name: str) -> RewardEvaluator:
         return CorrelationEvaluator()
     elif name.lower() == "gui":
         return GUIEvaluator()
+    elif name.lower() == "captcha":
+        return CaptchaEvaluator()
     else:
-        raise NotImplementedError(f"No evaluator implemented for {name}. Supported: 'clock', 'correlation', 'gui'")
+        raise NotImplementedError(f"No evaluator implemented for {name}. Supported: 'clock', 'correlation', 'gui', 'captcha'")
 
 
 class ClockEvaluator(RewardEvaluator):
@@ -601,3 +603,189 @@ class GUIEvaluator(RewardEvaluator):
         else:
             # print(f"Warning: Unexpected shape for reward_scores in GUIEvaluator.get_reward_breakdown: {reward_scores.shape}")
             return {'xml_format': 0.0, 'click_hit': 0.0, 'distance_to_center': 0.0}
+
+# --- CAPTCHA Evaluator ---
+from collections import Counter as CollectionCounter # To avoid conflict with local Counter
+
+# Constants for CaptchaEvaluator rewards
+# CAPTCHA_REWARD_PER_TP = 1.5  # Reward for each correctly clicked square
+# CAPTCHA_PENALTY_PER_FP = -1.0 # Penalty for each incorrectly clicked square
+# CAPTCHA_PENALTY_PER_FN = -0.75 # Penalty for each missed target square
+CAPTCHA_XML_FORMAT_REWARD = 0.5 # Bonus for correct XML structure (kept as a metric)
+# CAPTCHA_MAX_REWARD_NORMALIZATION = 5.0 # Target max reward for normalization - F1 is already 0-1
+# CAPTCHA_MIN_REWARD_NORMALIZATION = -5.0 # Target min reward for normalization
+
+class CaptchaEvaluator(RewardEvaluator):
+    """
+    Reward evaluator for the CAPTCHA square selection task.
+    Rewards based on F1 score of identifying target squares using `click_screen(x,y)` calls.
+    
+    Note: A grid square should only be considered as containing the target object 
+    if the target object occupies at least 20% of the square's area.
+    This threshold should be applied during dataset generation in captcha_generator.py.
+    """
+    def __init__(self):
+        self.click_call_pattern = re.compile(r"click_screen\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+        self.strict_xml_pattern = re.compile(r"^<reasoning>.*?<answer>.*?</answer>.*?$", re.DOTALL | re.IGNORECASE)
+        self.answer_tag_content_pattern = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+        self.num_reward_functions = 1 # Solely F1 score now for the main reward tensor
+        # Note: target_squares_boolean should be based on 20% object area threshold
+
+    def _extract_click_calls(self, completion_text: str) -> List[Tuple[int, int]]:
+        unique_clicks = set()
+        try:
+            answer_match = self.answer_tag_content_pattern.search(completion_text)
+            if not answer_match:
+                return [] 
+            answer_content = answer_match.group(1)
+            matches = self.click_call_pattern.findall(answer_content)
+            for match in matches:
+                try:
+                    x = int(match[0])
+                    y = int(match[1])
+                    if 0 <= x < 224 and 0 <= y < 224:
+                        unique_clicks.add((x, y))
+                except ValueError:
+                    continue 
+        except Exception:
+            pass 
+        return list(unique_clicks)
+
+    def _classify_clicks_and_get_stats(self, 
+                                       predicted_clicks: List[Tuple[int, int]], 
+                                       target_squares_boolean: List[bool],
+                                       target_square_coords_final: List[List[float]] # Currently unused but kept for API consistency
+                                       ) -> Dict[str, any]: # 'any' because f1 can be float
+        num_total_squares = len(target_squares_boolean)
+        clicked_ground_truth_indices = [False] * num_total_squares
+        true_positives = 0
+        false_positives = 0
+        true_target_indices = {i for i, is_true in enumerate(target_squares_boolean) if is_true}
+        num_actual_targets = len(true_target_indices)
+        predicted_clicks_on_square_indices = []
+
+        from captcha_generator import SQUARE_CROP_DIM, GRID_SIZE, CELL_DIM, BANNER_ABS_HEIGHT, FINAL_DIM, PADDING_SIZE
+        scale_x = FINAL_DIM / (SQUARE_CROP_DIM + 2 * PADDING_SIZE)
+        scale_y = FINAL_DIM / (BANNER_ABS_HEIGHT + SQUARE_CROP_DIM + 2 * PADDING_SIZE)
+        grid_origin_x_on_padded = PADDING_SIZE
+        grid_origin_y_on_padded = PADDING_SIZE + BANNER_ABS_HEIGHT
+        final_cell_dim_x = (CELL_DIM * scale_x)
+        final_cell_dim_y = (CELL_DIM * scale_y) 
+        final_grid_start_x = grid_origin_x_on_padded * scale_x
+        final_grid_start_y = grid_origin_y_on_padded * scale_y
+
+        for pred_x, pred_y in predicted_clicks:
+            found_match_in_any_square = False
+            clicked_square_idx = -1
+            for r in range(GRID_SIZE):
+                for c in range(GRID_SIZE):
+                    cell_idx = r * GRID_SIZE + c
+                    sq_x1 = final_grid_start_x + c * final_cell_dim_x
+                    sq_y1 = final_grid_start_y + r * final_cell_dim_y
+                    sq_x2 = sq_x1 + final_cell_dim_x
+                    sq_y2 = sq_y1 + final_cell_dim_y
+                    if sq_x1 <= pred_x < sq_x2 and sq_y1 <= pred_y < sq_y2:
+                        clicked_square_idx = cell_idx
+                        found_match_in_any_square = True
+                        break
+                if found_match_in_any_square: break
+            if found_match_in_any_square:
+                predicted_clicks_on_square_indices.append(clicked_square_idx)
+            else:
+                false_positives += 1 
+        
+        click_counts_per_square = CollectionCounter(predicted_clicks_on_square_indices)
+        for square_idx, num_clicks_in_square in click_counts_per_square.items():
+            if square_idx in true_target_indices:
+                true_positives += 1 
+                clicked_ground_truth_indices[square_idx] = True 
+                if num_clicks_in_square > 1:
+                    false_positives += (num_clicks_in_square - 1) 
+            else: 
+                false_positives += num_clicks_in_square 
+
+        false_negatives = num_actual_targets - sum(clicked_ground_truth_indices)
+        
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        
+        return {
+            "tp": true_positives,
+            "fp": false_positives,
+            "fn": false_negatives,
+            "num_actual_targets": num_actual_targets,
+            "num_predicted_clicks": len(predicted_clicks),
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1_score
+        }
+
+    def compute_rewards(
+        self,
+        prompts: Optional[List[List[Dict[str, str]]]], 
+        completions: List[List[Dict[str, str]]],
+        answers: List[Dict[str, Any]], 
+        device: str
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        num_completions = len(completions)
+        rewards_per_func = torch.zeros(num_completions, self.num_reward_functions, device=device)
+        all_f1_scores = []
+        all_tp = []
+        all_fp = []
+        all_fn = []
+        all_num_targets = []
+        all_num_predicted_clicks = []
+        all_precisions = []
+        all_recalls = []
+        xml_format_scores_list = []
+
+        for i in range(num_completions):
+            completion_text = completions[i][0]['content']
+            answer_data = answers[i]
+
+            xml_format_score = CAPTCHA_XML_FORMAT_REWARD if self.strict_xml_pattern.search(completion_text) else 0.0
+            xml_format_scores_list.append(xml_format_score)
+
+            predicted_clicks = self._extract_click_calls(completion_text)
+            target_squares_boolean = answer_data["target_squares_boolean"]
+            stats = self._classify_clicks_and_get_stats(predicted_clicks, target_squares_boolean, []) 
+            
+            f1 = stats["f1_score"]
+            rewards_per_func[i, 0] = f1 # F1 score is the direct reward signal
+            
+            all_f1_scores.append(f1)
+            all_tp.append(stats["tp"])
+            all_fp.append(stats["fp"])
+            all_fn.append(stats["fn"])
+            all_num_targets.append(stats["num_actual_targets"])
+            all_num_predicted_clicks.append(stats["num_predicted_clicks"])
+            all_precisions.append(stats["precision"])
+            all_recalls.append(stats["recall"])
+
+        metrics = {
+            "rewards/f1_score_reward": torch.tensor(all_f1_scores, dtype=torch.float32, device=device).mean().item() if all_f1_scores else 0.0,
+            "metrics/xml_format_score_avg": np.mean(xml_format_scores_list) if xml_format_scores_list else 0.0,
+            "reward": rewards_per_func.sum(dim=1).mean().item(), # This will be mean F1 score
+            "metrics/mean_true_positives": np.mean(all_tp) if all_tp else 0,
+            "metrics/mean_false_positives": np.mean(all_fp) if all_fp else 0,
+            "metrics/mean_false_negatives": np.mean(all_fn) if all_fn else 0,
+            "metrics/precision": np.mean(all_precisions) if all_precisions else 0,
+            "metrics/recall_percent_correct_squares": np.mean(all_recalls) if all_recalls else 0,
+            "metrics/f1_score": np.mean(all_f1_scores) if all_f1_scores else 0, # Overall F1 for the batch
+            "metrics/avg_predicted_clicks": np.mean(all_num_predicted_clicks) if all_num_predicted_clicks else 0,
+        }
+        return rewards_per_func, metrics
+
+    def get_reward_breakdown(self, reward_scores: torch.Tensor) -> Dict[str, float]:
+        if reward_scores.ndim == 1 and len(reward_scores) == self.num_reward_functions: # Should be 1
+            return {
+                'f1_score': reward_scores[0].item(),
+                # Add other components here if num_reward_functions > 1 in future
+            }
+        elif reward_scores.ndim == 2 and reward_scores.shape[1] == self.num_reward_functions:
+            return {
+                'f1_score': reward_scores[0, 0].item(),
+            }
+        else:
+            return {'f1_score': 0.0}
