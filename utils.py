@@ -311,7 +311,36 @@ def _add_completion_to_pdf(story: list, styles: dict, completion_text: str,
     story.append(Spacer(1, 0.05*inch))
 
     story.append(Paragraph(f"<b>Extracted Answer:</b>", styles['BodyText']))
-    story.append(Paragraph(html.escape(answer) if answer else "<i>N/A</i>", styles['Code']))
+    # Format the answer nicely for display, especially the tool call
+    if answer and dataset_type == 'gui':
+        if 'tool_name: click_tool' in answer:
+            try:
+                # Extract and display tool call in a more structured way
+                tool_name = re.search(r'tool_name:\s*([^\n]+)', answer)
+                x_coord = re.search(r'x:\s*(\d+)', answer)
+                y_coord = re.search(r'y:\s*(\d+)', answer)
+                
+                formatted_answer = f"<b>Tool Call:</b> {tool_name.group(1) if tool_name else 'click_tool'}<br/>"
+                formatted_answer += f"<b>x:</b> {x_coord.group(1) if x_coord else 'N/A'}<br/>"
+                formatted_answer += f"<b>y:</b> {y_coord.group(1) if y_coord else 'N/A'}"
+                
+                story.append(Paragraph(formatted_answer, styles['Code']))
+            except Exception:
+                # Fall back to regular display if parsing fails
+                story.append(Paragraph(html.escape(answer), styles['Code']))
+        else:
+            # Handle the case where there are just x/y coordinates without tool_name
+            x_coord = re.search(r'x:\s*(\d+)', answer)
+            y_coord = re.search(r'y:\s*(\d+)', answer)
+            if x_coord and y_coord:
+                formatted_answer = f"<b>Coordinates:</b><br/>"
+                formatted_answer += f"<b>x:</b> {x_coord.group(1)}<br/>"
+                formatted_answer += f"<b>y:</b> {y_coord.group(1)}"
+                story.append(Paragraph(formatted_answer, styles['Code']))
+            else:
+                story.append(Paragraph(html.escape(answer), styles['Code']))
+    else:
+        story.append(Paragraph(html.escape(answer) if answer else "<i>N/A</i>", styles['Code']))
     story.append(Spacer(1, 0.1*inch))
 
     if metrics:
@@ -420,7 +449,7 @@ def _process_single_completion_for_eval(
                     if parsed_click:
                         pil_img = PILImage.open(original_image_path)
                         plot_data = [{
-                            "name": "VLM Click", 
+                            "name": "VLM Click (Tool Call)", 
                             "center_x": parsed_click[0], 
                             "center_y": parsed_click[1],
                             "is_truth": False 
@@ -435,8 +464,7 @@ def _process_single_completion_for_eval(
                 else:
                     img_path_for_pdf_entry = original_image_path # Fallback for non-GUIEvaluator or if no click
             except Exception as plot_err:
-                if verbose: # Assuming verbose is accessible or passed
-                    print(f"  Warning: Error plotting click for PDF (utils): {plot_err}")
+                print(f"  Warning: Error plotting click for PDF (utils): {plot_err}")
                 img_path_for_pdf_entry = original_image_path # Fallback
         elif dataset_type != 'gui' and original_image_path:
              img_path_for_pdf_entry = original_image_path
@@ -444,20 +472,11 @@ def _process_single_completion_for_eval(
 
         _add_completion_to_pdf(
             story, styles, completion_text, 
-            reward_breakdown_for_pdf, # Pass the breakdown
-            total_reward_single, # Pass the total reward for this completion
+            reward_breakdown_for_pdf, # Pass the reward breakdown
             completion_idx,
-            # image_path_for_completion_pdf=img_path_for_pdf_entry # Add this if _add_completion_to_pdf supports it
-            # For now, _add_completion_to_pdf from snippet doesn't take image path directly for completion.
-            # It's usually added in _add_example_header_to_pdf.
-            # If you want image per completion, _add_completion_to_pdf needs an update.
+            dataset_type,
+            image_path_for_completion_pdf=img_path_for_pdf_entry # Add image path for completion
         )
-        
-        # Add PageBreak if needed (e.g., after every N completions)
-        # This logic might be better placed in the calling function (e.g., eval_on_test_set)
-        # as it depends on how many completions are processed per example.
-        # if (completion_idx + 1) % MAX_COMPLETIONS_PER_PAGE_PDF == 0:
-        # story.append(PageBreak())
     # --- End PDF Logging Section ---
 
     return processed_metrics_for_return
@@ -525,6 +544,37 @@ def _add_training_completion_to_pdf(story: list, styles: dict,
     story.append(Paragraph(escaped_completion, styles['Code']))
     story.append(Spacer(1, 0.05*inch))
 
+    # Extract and display reasoning and answer separately (for tool calls)
+    reasoning = _extract_tagged_content(completion_text, 'reasoning')
+    answer = _extract_tagged_content(completion_text, 'answer')
+
+    if reasoning:
+        story.append(Paragraph(f"<b>Extracted Reasoning:</b>", styles['BodyText']))
+        story.append(Paragraph(html.escape(reasoning), styles['Code']))
+        story.append(Spacer(1, 0.05*inch))
+
+    if answer:
+        story.append(Paragraph(f"<b>Extracted Answer:</b>", styles['BodyText']))
+        # Check if answer contains tool call
+        if 'tool_name: click_tool' in answer:
+            try:
+                # Extract and display tool call in a more structured way
+                tool_name = re.search(r'tool_name:\s*([^\n]+)', answer)
+                x_coord = re.search(r'x:\s*(\d+)', answer)
+                y_coord = re.search(r'y:\s*(\d+)', answer)
+                
+                formatted_answer = f"<b>Tool Call:</b> {tool_name.group(1) if tool_name else 'click_tool'}<br/>"
+                formatted_answer += f"<b>x:</b> {x_coord.group(1) if x_coord else 'N/A'}<br/>"
+                formatted_answer += f"<b>y:</b> {y_coord.group(1) if y_coord else 'N/A'}"
+                
+                story.append(Paragraph(formatted_answer, styles['Code']))
+            except Exception:
+                # Fall back to regular display if parsing fails
+                story.append(Paragraph(html.escape(answer), styles['Code']))
+        else:
+            story.append(Paragraph(html.escape(answer), styles['Code']))
+        story.append(Spacer(1, 0.05*inch))
+
     # Display Reward Breakdown and Advantage
     story.append(Paragraph(f"<b>Scores & Advantage:</b>", styles['BodyText']))
     data_table = [["Component", "Value"]]
@@ -550,6 +600,178 @@ def _add_training_completion_to_pdf(story: list, styles: dict,
     ]))
     story.append(table)
     story.append(Spacer(1, 0.15*inch))
+
+def log_tool_usage(
+    completions: list[str], 
+    click_success: list[bool], 
+    output_file: str,
+    round_num: int,
+    is_eval: bool = False
+):
+    """
+    Analyze completions for tool usage patterns and log statistics to a JSON file.
+    
+    Args:
+        completions: List of completion texts to analyze
+        click_success: List of booleans indicating if the final click was successful
+        output_file: Path to the JSON file to update
+        round_num: Current training/evaluation round number
+        is_eval: Whether this is evaluation (vs training)
+    """
+    # Define regex patterns for tool extraction
+    click_tool_pattern = re.compile(r"tool_name:\s*click_tool\s*\nx:\s*(\d+)\s*\ny:\s*(\d+)", re.MULTILINE)
+    check_click_pattern = re.compile(r"tool_name:\s*check_click", re.MULTILINE)
+    tool_response_pattern = re.compile(r"tool_response:\s*(True|False)", re.MULTILINE)
+    
+    # Initialize stats dictionary for this round
+    round_stats = {
+        "round": round_num,
+        "type": "eval" if is_eval else "train",
+        "total_completions": len(completions),
+        "click_success_count": sum(1 for success in click_success if success),
+        "click_success_rate": sum(click_success) / len(click_success) if click_success else 0,
+        "tool_usage": {
+            "click_tool": {
+                "total_usage": 0,
+                "avg_per_completion": 0,
+                "completions_with_usage": 0
+            },
+            "check_click": {
+                "total_usage": 0,
+                "avg_per_completion": 0,
+                "completions_with_usage": 0
+            },
+            "successful_tool_response": {
+                "total": 0,
+                "avg_per_completion": 0
+            }
+        },
+        "patterns": {
+            "avg_tools_before_success": 0,
+            "max_tools_in_single_completion": 0,
+            "click_check_pairs": 0  # Count of proper click→check sequences
+        },
+        "exemplars": {
+            "most_efficient": None,  # Will hold the completion with fewest tools to success
+            "least_efficient": None  # Will hold the completion with most tools
+        }
+    }
+    
+    # Track efficiency for finding exemplars
+    min_tools_to_success = float('inf')
+    max_tools_used = 0
+    most_efficient_completion = ""
+    least_efficient_completion = ""
+    
+    total_tools_before_success = 0
+    completions_with_success = 0
+    
+    # Process each completion
+    for i, completion in enumerate(completions):
+        is_success = click_success[i] if i < len(click_success) else False
+        
+        # Count tools in this completion
+        click_tool_matches = list(click_tool_pattern.finditer(completion))
+        check_click_matches = list(check_click_pattern.finditer(completion))
+        tool_response_matches = list(tool_response_pattern.finditer(completion))
+        
+        click_tool_count = len(click_tool_matches)
+        check_click_count = len(check_click_matches)
+        tool_response_count = len(tool_response_matches)
+        
+        # Update total counts
+        round_stats["tool_usage"]["click_tool"]["total_usage"] += click_tool_count
+        round_stats["tool_usage"]["check_click"]["total_usage"] += check_click_count
+        
+        # Update completions with usage counts
+        if click_tool_count > 0:
+            round_stats["tool_usage"]["click_tool"]["completions_with_usage"] += 1
+        if check_click_count > 0:
+            round_stats["tool_usage"]["check_click"]["completions_with_usage"] += 1
+            
+        # Count positive tool responses
+        successful_responses = sum(1 for m in tool_response_matches 
+                                  if m.group(1).lower() == 'true')
+        round_stats["tool_usage"]["successful_tool_response"]["total"] += successful_responses
+        
+        # Count proper click→check pairs
+        click_check_pairs = 0
+        for check_match in check_click_matches:
+            check_start = check_match.start()
+            # Look for a click_tool before this check_click
+            clicks_before = [m for m in click_tool_matches if m.start() < check_start]
+            if clicks_before:
+                click_check_pairs += 1
+        
+        round_stats["patterns"]["click_check_pairs"] += click_check_pairs
+        
+        # Track total tools used
+        total_tools = click_tool_count + check_click_count
+        
+        # Update max tools in a single completion
+        if total_tools > round_stats["patterns"]["max_tools_in_single_completion"]:
+            round_stats["patterns"]["max_tools_in_single_completion"] = total_tools
+            
+        # Track efficiency for successful completions
+        if is_success:
+            completions_with_success += 1
+            total_tools_before_success += total_tools
+            
+            # Track most efficient completion
+            if total_tools < min_tools_to_success:
+                min_tools_to_success = total_tools
+                most_efficient_completion = completion
+                
+            # Track least efficient completion
+            if total_tools > max_tools_used:
+                max_tools_used = total_tools
+                least_efficient_completion = completion
+    
+    # Calculate averages
+    if len(completions) > 0:
+        round_stats["tool_usage"]["click_tool"]["avg_per_completion"] = (
+            round_stats["tool_usage"]["click_tool"]["total_usage"] / len(completions)
+        )
+        round_stats["tool_usage"]["check_click"]["avg_per_completion"] = (
+            round_stats["tool_usage"]["check_click"]["total_usage"] / len(completions)
+        )
+        round_stats["tool_usage"]["successful_tool_response"]["avg_per_completion"] = (
+            round_stats["tool_usage"]["successful_tool_response"]["total"] / len(completions)
+        )
+    
+    if completions_with_success > 0:
+        round_stats["patterns"]["avg_tools_before_success"] = (
+            total_tools_before_success / completions_with_success
+        )
+    
+    # Add exemplars
+    if most_efficient_completion:
+        # Truncate to reduce file size
+        round_stats["exemplars"]["most_efficient"] = most_efficient_completion[:500] + "..." if len(most_efficient_completion) > 500 else most_efficient_completion
+    if least_efficient_completion:
+        round_stats["exemplars"]["least_efficient"] = least_efficient_completion[:500] + "..." if len(least_efficient_completion) > 500 else least_efficient_completion
+    
+    # Load existing data if file exists
+    existing_data = []
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                existing_data = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            print(f"Warning: Could not read existing tool usage data from {output_file}")
+            existing_data = []
+    
+    # Add new round data
+    existing_data.append(round_stats)
+    
+    # Write updated data
+    with open(output_file, 'w') as f:
+        json.dump(existing_data, f, indent=2)
+    
+    print(f"Tool usage stats for round {round_num} saved to {output_file}")
+    
+    # Return the stats for possible further use
+    return round_stats
 
 
 

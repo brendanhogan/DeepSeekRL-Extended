@@ -199,18 +199,38 @@ class CorrelationScatterDataLoader(DataLoader):
 # Dynamic prompt, base template here. {target_object_name} will be replaced.
 GUI_PROMPT_TEMPLATE = """
 You will be shown an image of a graphical user interface (GUI).
-The image is 224x224 pixels.
+The image is 384x384 pixels.
 Your task is to identify and provide the coordinates to click the target object: '{target_object_name}'.
 
-You must answer in the following format exactly:
+You must use these tool in your reasoning process:
+
+1. Click tool - Any click attempt must be registered through this tool:
+tool_name: click_tool
+x: [x_coordinate]
+y: [y_coordinate]
+
+2. Check click tool - Must be called after a click_tool to verify success:
+tool_name: check_click
+
+After using check_click, the system will automatically append:
+tool_response: True  (if click was successful)
+tool_response: False (if click was unsuccessful)
+
+Important:
+- Use the  check_click only in the <reasoning> section
+- You can use multiple click_tool attempts to find the target
+- Each check_click must follow a click_tool
+- Only put your final coordinates in the <answer> section
+
 <reasoning>
-Briefly describe your reasoning for choosing the click location based on the target object's appearance and position.
+Your reasoning and tool usage goes here.
 </reasoning>
+Your final answer must use the click_tool to click the target.
 <answer>
-x,y
+tool_name: click_tool
+x: x_coordinate
+y: y_coordinate
 </answer>
-Replace x and y with the integer pixel coordinates (e.g., 123,45) where you would click for the '{target_object_name}'. The coordinates must be within the 0-223 range for both x and y.
-Do not include any other text in your answer, or any other text after </answer>.
 
 Where would you click to interact with the '{target_object_name}'?
 """
@@ -228,7 +248,7 @@ class GUIDataLoader(DataLoader):
         # `self.prompt` will be dynamically set in __next__ for this loader
     """
     def __init__(self, dataset_size: int = 50, is_train: bool = True, 
-                 image_width: int = 224, image_height: int = 224, 
+                 image_width: int = 384, image_height: int = 384, 
                  hard_mode_prob: float = 0.1):
         super().__init__(random=True)
         self.dataset_size = dataset_size
@@ -265,7 +285,7 @@ class GUIDataLoader(DataLoader):
         target_info = None
         max_retries = 5 
         for _ in range(max_retries):
-            gui_image, _, temp_target_info = self.gui_generator.generate_scene_with_target(generate_hard_mode=use_hard_mode)
+            gui_image, _, temp_target_info = self.gui_generator.generate_scene_with_target()
             if temp_target_info:
                 target_info = temp_target_info
                 break
@@ -315,8 +335,8 @@ def get_dataloaders(dataset_name: str, **kwargs) -> Tuple[DataLoader, DataLoader
         ValueError: If dataset_name is not supported.
     """
     dataset_size = kwargs.get('dataset_size', 50)
-    image_width = kwargs.get('image_width', 224)
-    image_height = kwargs.get('image_height', 224)
+    image_width = kwargs.get('image_width', 384)
+    image_height = kwargs.get('image_height', 384)
     # Get hard mode probability from kwargs, default to 0.1 for training
     hard_mode_prob_train = kwargs.get('hard_mode_prob_train', 0.1)
     # Default hard mode prob for testing is 0.0 unless specified

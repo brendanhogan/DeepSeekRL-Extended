@@ -136,6 +136,76 @@ This demonstrates the model's ability to learn numerical relationships presented
     ```
 4.  **Monitor Results:** Use `plotter.py` on the `output_dir`.
 
+## GUI Interaction with Tool System
+
+### Overview
+
+The GUI interaction task has been enhanced with a tool-based interaction system that makes the training process more realistic. The system now includes:
+
+1. A `click_tool` for specifying where to click on GUI elements
+2. A `check_click` tool for verifying whether a click was successful
+3. Automated generation of tool responses based on click success
+
+### Tool Usage
+
+The model is instructed to use these tools in the reasoning section to explore potential targets:
+
+```
+<reasoning>
+I'll analyze the position of the target element.
+
+tool_name: click_tool
+x: 123
+y: 456
+
+Let me verify this click:
+tool_name: check_click
+tool_response: False
+
+Let me try a different location:
+tool_name: click_tool
+x: 280
+y: 70
+
+Let me verify:
+tool_name: check_click
+tool_response: True
+
+Based on the successful verification, I'll click at (280, 70).
+</reasoning>
+<answer>
+x: 280
+y: 70
+</answer>
+```
+
+The final answer section contains only the coordinates that the model determined to be correct through its reasoning process.
+
+### Implementation Details
+
+- The model uses tools in the reasoning section to experiment with different coordinates
+- The `check_click` tool analyzes the previous click coordinates and determines whether they hit the target element
+- For circular elements (like window control buttons), a circular hit detection is used
+- For rectangular elements, a bounding box check is used
+- The evaluator rewards proper tool usage within the reasoning section
+- After deciding on the best coordinates through experimentation, only the final coordinates are placed in the answer section
+
+### Rewards
+
+A model is rewarded based on:
+1. XML/YAML formatting and proper tool usage in reasoning
+2. Click hit accuracy of the final coordinates
+3. Distance to center from the final coordinates
+4. Tool usage pattern (using the check_click tool to verify actions)
+
+The highest rewards go to models that:
+1. Properly explore different click options in the reasoning section
+2. Use the check_click tool to verify clicks
+3. Select the correct final coordinates based on verification
+4. Place only the clean coordinate format in the answer section
+
+This approach teaches models to reason through their UI interactions, verify their actions, and provide clean, structured outputs - crucial skills for interactive agents.
+
 ## Next Steps
 
 Future work aims to explore more complex interactions and reasoning:

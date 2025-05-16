@@ -8,7 +8,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.ticker import MaxNLocator
 import re
 from collections import defaultdict
-from typing import Optional # Added for type hinting
+from typing import Optional
 
 def moving_average(data, window_size=5):
     """Calculate moving average with given window size"""
@@ -42,8 +42,8 @@ def apply_retro_futurism_style(ax, fig, line_color):
     
     return line_color
 
-def plot_metric(metric_name, rounds, values, output_path, line_color_hex, claude_score: Optional[float] = None):
-    """Plots a single metric over rounds and saves it as a PNG, optionally adding a Claude score line."""
+def plot_metric(metric_name, rounds, values, output_path, line_color_hex):
+    """Plots a single metric over rounds and saves it as a PNG."""
     global text_color, bg_color, grid_color # Ensure access to global style vars
 
     print(f"Plotting {metric_name}...")
@@ -66,10 +66,6 @@ def plot_metric(metric_name, rounds, values, output_path, line_color_hex, claude
                 zorder=5)
 
     ax.fill_between(rounds, values, color=actual_line_color, alpha=0.1, zorder=1)
-    
-    # Add Claude's score as a horizontal line if provided
-    if claude_score is not None:
-        ax.axhline(y=claude_score, color='#FFD700', linestyle='--', linewidth=2.5, label='Claude Sonnet 3.7 Level', zorder=15) # Gold color, slightly thicker
 
     try:
         plt.rcParams['font.family'] = 'Consolas'
@@ -107,36 +103,28 @@ def plot_metric(metric_name, rounds, values, output_path, line_color_hex, claude
         print(f"Error saving plot {output_path}: {e}")
     plt.close(fig)
 
-def create_plots():
+def create_plots(output_dir):
     global text_color, bg_color, grid_color # Define globals for styling consistency
     text_color = '#E0E0E0'
     bg_color = '#212946'
     grid_color = '#2A3459'
 
-    json_reports_dir = "gui_testing_hard/eval_logs/json_reports/"
-    plots_output_dir = "gui_plots/"
-    claude_eval_json_path = "claude_gui_eval_results/claude_eval.json"
+    json_reports_dir = os.path.join(output_dir, "eval_logs", "json_reports")
+    plots_output_dir = os.path.join(output_dir, "plots")
 
     if not os.path.exists(plots_output_dir):
         os.makedirs(plots_output_dir)
         print(f"Created directory: {plots_output_dir}")
 
-    # Load Claude's evaluation scores
-    claude_scores_data = {}
-    if os.path.exists(claude_eval_json_path):
-        try:
-            with open(claude_eval_json_path, 'r') as f:
-                claude_scores_data = json.load(f)
-            print(f"Successfully loaded Claude scores from {claude_eval_json_path}")
-        except json.JSONDecodeError:
-            print(f"Error decoding JSON from {claude_eval_json_path}. Claude scores will not be plotted.")
-        except Exception as e:
-            print(f"Error loading Claude scores from {claude_eval_json_path}: {e}. Claude scores will not be plotted.")
-    else:
-        print(f"Warning: Claude scores file not found at {claude_eval_json_path}. Claude lines will not be plotted.")
-
     all_metrics_data = defaultdict(lambda: {'rounds': [], 'values': []})
-    json_files = [f for f in os.listdir(json_reports_dir) if f.startswith('average_scores_round_') and f.endswith('.json')]
+    json_files = []
+    
+    if os.path.exists(json_reports_dir):
+        json_files = [f for f in os.listdir(json_reports_dir) if f.startswith('average_scores_round_') and f.endswith('.json')]
+    
+    if not json_files:
+        print(f"No 'average_scores_round_*.json' files found in {json_reports_dir}")
+        return
 
     def extract_round_num(filename):
         match = re.search(r'average_scores_round_(\d+)\.json', filename)
@@ -144,10 +132,7 @@ def create_plots():
 
     json_files.sort(key=extract_round_num)
     
-    if not json_files:
-        print(f"No 'average_scores_round_*.json' files found in {json_reports_dir}")
-        return
-    print(f"Found {len(json_files)} average score JSON files for the main model.")
+    print(f"Found {len(json_files)} average score JSON files.")
 
     for filename in json_files:
         round_num = extract_round_num(filename)
@@ -165,7 +150,7 @@ def create_plots():
             print(f"Error processing file {file_path}: {e}, skipping.")
 
     if not all_metrics_data:
-        print("No plottable data found in main model JSON files.")
+        print("No plottable data found in JSON files.")
         return
 
     line_colors = ['#08F7FE', '#FE53BB', '#F5D300', '#00FF41', '#FF6C11', '#FD1D53', '#710193', '#FFFFFF']
@@ -180,13 +165,7 @@ def create_plots():
         output_path = os.path.join(plots_output_dir, output_filename)
         current_line_color = line_colors[i % len(line_colors)]
         
-        # Get Claude's score for the current metric
-        claude_value_for_metric = claude_scores_data.get(metric_name)
-        if claude_value_for_metric is not None and not isinstance(claude_value_for_metric, (int, float)):
-            print(f"Warning: Claude score for '{metric_name}' is not a number: {claude_value_for_metric}. Not plotting Claude line.")
-            claude_value_for_metric = None
-            
-        plot_metric(metric_name, data['rounds'], data['values'], output_path, current_line_color, claude_score=claude_value_for_metric)
+        plot_metric(metric_name, data['rounds'], data['values'], output_path, current_line_color)
 
 def plot_metrics(output_dir):
     """
@@ -199,21 +178,22 @@ def plot_metrics(output_dir):
     if not os.path.exists(train_logs_path):
         print(f"Error: Training log file not found at {train_logs_path}")
         return
-    with open(train_logs_path, 'r') as f:
-        try:
+    
+    try:
+        with open(train_logs_path, 'r') as f:
             train_logs = json.load(f)
-        except json.JSONDecodeError as e:
-            print(f"Error decoding JSON from {train_logs_path}: {e}")
-            return
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON from {train_logs_path}: {e}")
+        return
 
     # Load evaluation logs
     eval_logs = {}
-    eval_json_dir = os.path.join(output_dir, 'eval_logs', 'json') # Updated path
+    eval_json_dir = os.path.join(output_dir, 'eval_logs', 'json')
     if os.path.exists(eval_json_dir):
         for filename in os.listdir(eval_json_dir):
             if filename.startswith('eval_metrics_') and filename.endswith('.json'):
                 try:
-                    # Corrected round number extraction
+                    # Extract round number
                     round_num = int(filename.split('_')[2].split('.')[0]) 
                     with open(os.path.join(eval_json_dir, filename), 'r') as f:
                         eval_logs[round_num] = json.load(f)
@@ -221,7 +201,6 @@ def plot_metrics(output_dir):
                     print(f"Warning: Could not process evaluation log file {filename}: {e}")
     else:
         print(f"Warning: Evaluation log directory not found at {eval_json_dir}")
-
 
     # Set style and color palette
     plt.style.use('bmh')  # Using 'bmh' style which is a modern, clean style
@@ -308,7 +287,6 @@ def plot_metrics(output_dir):
             else:
                 print("Warning: 'learning_rate' key not found in training logs.")
 
-
             # Plot other identified training metrics (e.g., loss, kl, reward_std)
             print(f"Plotting other training metrics: {other_metrics}")
             metric_color_map = {metric: color for metric, color in zip(other_metrics, ['#e67e22', '#9b59b6', '#3498db', '#f1c40f', '#1abc9c'])} # Different colors
@@ -352,23 +330,6 @@ def plot_metrics(output_dir):
             # Use round numbers as steps for evaluation plots
             eval_steps = sorted(eval_logs.keys()) 
             
-            # Remove the dedicated accuracy plot section as it should be handled below if present in average_metrics
-            # if all('overall_accuracy_percent' in eval_logs[step] for step in eval_steps):
-            #     plt.figure(figsize=(12,7))
-            #     # Use the correct key, already stored as percentage
-            #     accuracy_values = [eval_logs[step]['overall_accuracy_percent'] for step in eval_steps] 
-            #     plt.plot(eval_steps, accuracy_values, color='#2ecc71', linewidth=2.0, marker='o', label='Accuracy')
-            #     plt.xlabel('Evaluation Round', fontsize=12) # Changed label
-            #     plt.ylabel('Accuracy (%)', fontsize=12)
-            #     plt.title('Evaluation Accuracy', fontsize=14, pad=20)
-            #     plt.grid(True, alpha=0.3)
-            #     plt.xticks(eval_steps) # Ensure ticks match evaluation rounds
-            #     plt.legend()
-            #     pdf.savefig(bbox_inches='tight')
-            #     plt.close()
-            # else:
-            #     print("Warning: 'overall_accuracy_percent' key missing in some evaluation logs. Skipping accuracy plot.")
-
             # Plot all evaluation metrics found in 'average_metrics'
             if not eval_steps:
                  print("Warning: No evaluation rounds found.")
@@ -418,13 +379,15 @@ def plot_metrics(output_dir):
                         pdf.savefig(bbox_inches='tight')
 
                         # --- Save specific plots as PNG ---
-                        print(plot_title)
+                        png_dir = os.path.join(output_dir, "plots")
+                        os.makedirs(png_dir, exist_ok=True)
+                        
                         if plot_title == "Avg Reward":
-                             png_path = os.path.join(output_dir, "evaluation_avg_reward.png")
+                             png_path = os.path.join(png_dir, "evaluation_avg_reward.png")
                              plt.savefig(png_path, bbox_inches='tight')
                              print(f"Saved specific plot: {png_path}")
                         elif plot_title == "Avg Metrics - Mean Abs Correlation Error":
-                             png_path = os.path.join(output_dir, "evaluation_mean_abs_correlation_error.png")
+                             png_path = os.path.join(png_dir, "evaluation_mean_abs_correlation_error.png")
                              plt.savefig(png_path, bbox_inches='tight')
                              print(f"Saved specific plot: {png_path}")
                         # --- End save specific plots ---
@@ -441,8 +404,9 @@ def plot_metrics(output_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Plot training and evaluation metrics from logs directory')
     parser.add_argument('--output_dir', type=str, required=True, help='Main output directory containing training_logs and eval_logs subdirectories')
-    # Removed log_dir as output_dir is now the standard
     args = parser.parse_args()
+    
     plot_metrics(args.output_dir)
-    create_plots()
+    create_plots(args.output_dir)
+    
     print("Plotting script finished.")

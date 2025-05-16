@@ -7,7 +7,7 @@ import torch
 import argparse
 from tqdm import tqdm
 import soundfile as sf
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 from shutil import copyfile
 from collections import defaultdict
 from qwen_vl_utils import process_vision_info
@@ -23,6 +23,9 @@ import utils
 import evaluator
 import rldatasets
 from gui_generator import GUIGenerator # For PDF plotting
+
+import re
+import math
 
 def eval_on_test_set(
     model: PreTrainedModel,
@@ -48,6 +51,10 @@ def eval_on_test_set(
     aggregated_metrics_sum_overall = defaultdict(float)
     aggregated_metrics_sum_normal = defaultdict(float)
     aggregated_metrics_sum_hard = defaultdict(float)
+    
+    # For tool usage logging
+    all_completions = []
+    all_click_success = []
     
     # Ensure temp_vis directory exists for saving images with clicks for PDF
     eval_temp_vis_dir = os.path.join(args.output_dir, 'eval_logs', 'temp_vis')
@@ -86,12 +93,15 @@ def eval_on_test_set(
         # Generate completions
         # Ensure generate_completions uses the correct prompt (dynamic for GUI)
         _, _, _, _, completions_text, _ = generate_completions(
-            model, tokenizer, img_path, prompt_to_use, device, args, eval=True)
+            model, tokenizer, img_path, prompt_to_use, device, args, eval=True, target_details=target_details_dict)
         
         # Add example header to PDF (prompt_to_use will have target name for GUI)
         utils._add_example_header_to_pdf(story, styles, img_path, prompt_to_use, 
                                          answer_for_eval_and_pdf, num_examples, args.dataset_type,
                                          is_hard=is_hard_example)
+        
+        # For GUI tasks, collect click success information
+        batch_click_success = []
         
         for completion_idx, completion_text in enumerate(completions_text):
             # Path for saving image with plotted click (unique per completion)
@@ -111,6 +121,15 @@ def eval_on_test_set(
                 vis_image_path_for_pdf=vis_image_path_for_pdf, # Path to save visualization
                 gui_plotter=GUIGenerator.plot_predictions if args.dataset_type == 'gui' else None
             )
+            
+            # Log click success for tool usage statistics (if GUI task)
+            if args.dataset_type == 'gui' and metrics_single:
+                click_hit = metrics_single.get('click_hit', 0.0) > 0
+                batch_click_success.append(click_hit)
+                
+                # Collect for overall logging
+                all_completions.append(completion_text)
+                all_click_success.append(click_hit)
             
             num_chains_processed_overall += 1
             if metrics_single and isinstance(metrics_single, dict):
@@ -136,9 +155,7 @@ def eval_on_test_set(
                             aggregated_metrics_sum_normal[metric_name] += value
                         elif torch.is_tensor(value) and value.numel() == 1:
                             aggregated_metrics_sum_normal[metric_name] += value.item()
-        
         num_examples += 1
-
     # --- Calculate final averages --- 
     avg_scores_overall = {}
     avg_scores_normal = {}
@@ -164,6 +181,17 @@ def eval_on_test_set(
     print(f"PDF report saved to {pdf_path}")
 
     utils._calculate_and_log_final_metrics(all_avg_scores, json_dir, round_num, args.verbose)
+    
+    # Log tool usage if this is a GUI task
+    if args.dataset_type == 'gui' and all_completions:
+        tool_log_file = os.path.join(json_dir, 'tool_usage.json')
+        utils.log_tool_usage(
+            completions=all_completions,
+            click_success=all_click_success,
+            output_file=tool_log_file,
+            round_num=round_num,
+            is_eval=True
+        )
 
     return all_avg_scores, final_avg_main_metric_value # Return all avg scores and the specific main error metric value
 
@@ -174,7 +202,8 @@ def generate_completions(
     prompt: str,
     device: str,
     args: argparse.Namespace, 
-    eval: bool = False
+    eval: bool = False,
+    target_details: Optional[Dict[str, Any]] = None  # Added parameter for target details
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], str]:
     """
     Generate multiple completion sequences for a given prompt using a language model.
@@ -186,6 +215,8 @@ def generate_completions(
         prompt: The input prompt to generate completions for
         device: Device to run generation on ('cpu' or 'cuda')
         args: Namespace containing generation parameters
+        eval: Whether this is an evaluation run
+        target_details: Dictionary with target object details (for GUI tasks)
         
     Returns:
         prompt_completion_ids: Tensor containing the full sequence of prompt + completion token IDs
@@ -274,6 +305,85 @@ def generate_completions(
 
     # Decode completions
     completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    
+    # Process tool calls if this is a GUI task with target details
+    if args.dataset_type == 'gui' and target_details is not None:
+        # Define patterns for tool processing
+        click_tool_pattern = re.compile(r"tool_name:\s*click_tool\s*\nx:\s*(\d+)\s*\ny:\s*(\d+)", re.MULTILINE)
+        check_click_pattern = re.compile(r"tool_name:\s*check_click(?!\s*\ntool_response)", re.MULTILINE)
+        
+        # Process each completion
+        processed_completions = []
+        for comp_text in completions_text:
+            # Extract the reasoning section
+            reasoning_section = ""
+            try:
+                reasoning_section_parts = comp_text.split("<reasoning>")
+                if len(reasoning_section_parts) > 1:
+                    reasoning_section = reasoning_section_parts[-1].split("</reasoning>")[0]
+            except (IndexError, ValueError):
+                # If can't extract reasoning, use the whole text as fallback
+                reasoning_section = comp_text
+            
+            # Check if there's a check_click tool call in the reasoning that doesn't already have a response
+            modified_content = comp_text
+            check_matches = list(check_click_pattern.finditer(reasoning_section))
+            
+            if check_matches:
+                # Process each check_click call that needs a response
+                for check_match in check_matches:
+                    # Find the most recent click_tool call before this check_click
+                    click_matches = list(click_tool_pattern.finditer(reasoning_section[:check_match.start()]))
+                    
+                    if click_matches:
+                        # Get the most recent click coordinates
+                        last_click = click_matches[-1]
+                        click_x = int(last_click.group(1))
+                        click_y = int(last_click.group(2))
+                        
+                        # Check if click was successful
+                        target_bbox = target_details.get('bounding_box', None)
+                        target_name = target_details.get('name', '')
+                        
+                        if target_bbox:
+                            # Check if it's a circular element
+                            circular_elements = {"window_close_button", "window_minimize_button", "window_maximize_button"}
+                            if target_name in circular_elements:
+                                # Use circular hit detection
+                                x_min, y_min, x_max, y_max = target_bbox
+                                center_x = (x_min + x_max) / 2
+                                center_y = (y_min + y_max) / 2
+                                radius = (x_max - x_min) / 2
+                                distance = math.sqrt((click_x - center_x)**2 + (click_y - center_y)**2)
+                                is_hit = distance <= radius
+                            else:
+                                # Use bounding box hit detection
+                                x_min, y_min, x_max, y_max = target_bbox
+                                is_hit = (x_min <= click_x <= x_max) and (y_min <= click_y <= y_max)
+                        else:
+                            is_hit = False
+                        
+                        # Add tool response line after the check_click tool call
+                        response_text = "True" if is_hit else "False"
+                        check_end = check_match.end()
+                        replacement = f"{check_match.group(0)}\ntool_response: {response_text}"
+                        
+                        # Replace in the full text
+                        before_match = modified_content.split(check_match.group(0))[0]
+                        after_match = modified_content.split(check_match.group(0))[1]
+                        modified_content = before_match + replacement + after_match
+                    else:
+                        # No click coordinates found, assume failed check
+                        replacement = f"{check_match.group(0)}\ntool_response: False"
+                        before_match = modified_content.split(check_match.group(0))[0]
+                        after_match = modified_content.split(check_match.group(0))[1]
+                        modified_content = before_match + replacement + after_match
+            
+            processed_completions.append(modified_content)
+        
+        # Replace original completions with processed ones
+        completions_text = processed_completions
+    
     return prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt
     
 def score_completions(
@@ -439,12 +549,14 @@ def grpo_loss(
         # answer_details_or_string is also target_details_dict
         current_prompt_text = prompt_info_or_static_prompt['dynamic_prompt']
         current_answer_data = answer_details_or_string # This is the dict for GUIEvaluator
+        target_details = prompt_info_or_static_prompt  # Use the complete target details for tool processing
     else:
         current_prompt_text = prompt_info_or_static_prompt
         current_answer_data = answer_details_or_string # This is the string for Clock/Corr
+        target_details = None  # No target details for non-GUI tasks
 
     prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, _ = generate_completions(
-        model, tokenizer, img_path, current_prompt_text, device, args
+        model, tokenizer, img_path, current_prompt_text, device, args, target_details=target_details
     )
 
     rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
@@ -460,6 +572,25 @@ def grpo_loss(
     log_file_name = f'round_{round_num}_batch_generations.txt' # More descriptive name
     log_file = os.path.join(training_log_dir, log_file_name)
     utils.write_generation_log(log_data, log_file)
+    
+    # For GUI tasks, log tool usage statistics
+    if args.dataset_type == 'gui':
+        # Extract click success information from rewards
+        click_success = []
+        for i, reward_scores in enumerate(rewards_per_func):
+            # Use the click_hit reward component (index 1) to determine success
+            click_hit = reward_scores[1].item() > 0
+            click_success.append(click_hit)
+        
+        # Log tool usage
+        tool_log_file = os.path.join(training_log_dir, 'tool_usage.json')
+        utils.log_tool_usage(
+            completions=completions_text,
+            click_success=click_success,
+            output_file=tool_log_file,
+            round_num=round_num,
+            is_eval=False
+        )
     
     image_log_dir = os.path.join(training_log_dir, 'images')
     os.makedirs(image_log_dir, exist_ok=True)
@@ -604,7 +735,7 @@ if __name__ == "__main__":
 
     for round_num in tqdm(range(start_round, args.num_train_iters), initial=start_round, total=args.num_train_iters, desc="Training Progress"):
         
-        # --- Evaluation Step --- (Run periodically)
+        # # --- Evaluation Step --- (Run periodically)
         if round_num % args.eval_iterations == 0:
             eval_avg_scores, eval_main_metric_val = eval_on_test_set(
                 model=model,
@@ -720,7 +851,7 @@ if __name__ == "__main__":
                             if parsed_click:
                                 pil_img = PILImage.open(log_data['img_path'])
                                 plot_data = [{
-                                    "name": "VLM Click", 
+                                    "name": "VLM Click (Tool Call)", 
                                     "center_x": parsed_click[0], 
                                     "center_y": parsed_click[1],
                                     "is_truth": False
@@ -784,4 +915,3 @@ if __name__ == "__main__":
 
         # Add after each major operation in the training loop
         torch.cuda.empty_cache()
-       

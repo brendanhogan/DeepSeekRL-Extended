@@ -413,33 +413,78 @@ class GUIEvaluator(RewardEvaluator):
     Reward evaluator for the GUI Interaction (click prediction) task.
     
     Implements reward functions for:
-    - Strict XML formatting (<reasoning>/<answer>x,y</answer>)
+    - Strict XML formatting with YAML-style tool call
     - Click Hit (whether the click is within the target bounding box)
     - Distance to Center (Euclidean distance from click to target center, scaled)
+    - Tool Usage (correct sequence of tool usage: click_tool followed by check_click)
     """
     
     def __init__(self):
-        self.num_reward_functions = 3 # XML Format, Click Hit, Distance to Center
-        # Regex to extract "x,y" coordinates, allowing for spaces around comma
-        self.coord_extract_pattern = re.compile(r"(\d+)\s*,\s*(\d+)")
-        # Regex for the strict overall XML format, ensuring x,y in answer
-        # This pattern is more specific for the answer part to guide the LLM.
-        self.strict_xml_pattern = re.compile(r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n\d+\s*,\s*\d+\n</answer>\n$", re.DOTALL)
+        self.num_reward_functions = 4  # Added fourth reward component for tool usage
+        # Updated regex patterns for the new structure
+        # Tool call patterns now look for these in the reasoning section
+        self.tool_call_pattern = re.compile(r"tool_name:\s*click_tool\s*\nx:\s*(\d+)\s*\ny:\s*(\d+)", re.MULTILINE)
+        self.check_click_pattern = re.compile(r"tool_name:\s*check_click", re.MULTILINE)
+        self.tool_response_pattern = re.compile(r"tool_response:\s*(True|False)", re.MULTILINE)
+        
+        # Updated answer pattern that expects only coordinates in the answer section
+        self.answer_coords_pattern = re.compile(r"<answer>\s*x:\s*(\d+)\s*\ny:\s*(\d+)\s*\n</answer>", re.DOTALL)
+        
+        # Regex for the strict XML format, updated for new structure
+        self.strict_xml_pattern = re.compile(r"^<reasoning>\n.*?tool_name:\s*click_tool.*?tool_name:\s*check_click.*?\n</reasoning>\n<answer>\s*((tool_name:\s*click_tool\s*\n)?x:\s*\d+\s*\ny:\s*\d+)\s*\n</answer>\n$", re.DOTALL)
+        
         # Define names of known circular elements
         self.circular_elements = {"window_close_button", "window_minimize_button", "window_maximize_button"}
 
     def _extract_coordinates(self, text: str) -> Optional[Tuple[int, int]]:
-        """Extract x,y coordinates from the <answer> tag."""
+        """Extract x,y coordinates from the answer section."""
         try:
-            answer_content = text.split("<answer>")[-1].split("</answer>")[0].strip()
-            match = self.coord_extract_pattern.search(answer_content)
-            if match:
-                x = int(match.group(1))
-                y = int(match.group(2))
-                # Basic check for coordinates being within typical image bounds (e.g., 0-1024, can be refined based on actual image size if needed)
-                # For now, GUIGenerator uses 224x224. We can add stricter checks if x/y are way off.
-                if 0 <= x <= IMAGE_WIDTH*2 and 0 <= y <= IMAGE_HEIGHT*2: # Allow some leeway beyond 224 for robustness
+            # Look for click_tool in the answer section first (final answer)
+            answer_content = ""
+            try:
+                answer_content = text.split("<answer>")[-1].split("</answer>")[0].strip()
+            except IndexError:
+                pass
+                
+            # First check for click_tool in the answer section
+            if "tool_name: click_tool" in answer_content:
+                # Extract coordinates from click_tool in answer
+                x_match = re.search(r"x:\s*(\d+)", answer_content)
+                y_match = re.search(r"y:\s*(\d+)", answer_content)
+                if x_match and y_match:
+                    x = int(x_match.group(1))
+                    y = int(y_match.group(1))
+                    # Basic check for coordinates being within typical image bounds
+                    if 0 <= x <= IMAGE_WIDTH*2 and 0 <= y <= IMAGE_HEIGHT*2:
+                        return x, y
+            
+            # Look for simple x/y coordinates in answer as fallback
+            x_match = re.search(r"x:\s*(\d+)", answer_content)
+            y_match = re.search(r"y:\s*(\d+)", answer_content)
+            if x_match and y_match:
+                x = int(x_match.group(1))
+                y = int(y_match.group(1))
+                if 0 <= x <= IMAGE_WIDTH*2 and 0 <= y <= IMAGE_HEIGHT*2:
                     return x, y
+                    
+            # If no coordinates in answer section, look for the last click_tool call in reasoning
+            # This is a fallback for models that haven't adapted to the new format
+            reasoning_content = ""
+            try:
+                reasoning_content = text.split("<reasoning>")[-1].split("</reasoning>")[0]
+            except IndexError:
+                reasoning_content = text  # Fallback to full text
+                
+            # Find all click_tool calls in the reasoning section
+            all_click_matches = list(self.tool_call_pattern.finditer(reasoning_content))
+            if all_click_matches:
+                # Use the last click_tool call (most likely the final decision)
+                last_match = all_click_matches[-1]
+                x = int(last_match.group(1))
+                y = int(last_match.group(2))
+                if 0 <= x <= IMAGE_WIDTH*2 and 0 <= y <= IMAGE_HEIGHT*2:
+                    return x, y
+                    
             return None
         except (IndexError, ValueError):
             return None # Tags not found, incorrect structure, or int conversion failed
@@ -463,19 +508,33 @@ class GUIEvaluator(RewardEvaluator):
             return x_min <= x <= x_max and y_min <= y <= y_max
 
     def _strict_xml_format_reward(self, completions: List[List[Dict[str, str]]]) -> List[float]:
-        """Reward for strict <reasoning>...</reasoning><answer>x,y</answer> format."""
+        """Reward for strict XML format with proper structure."""
         responses = [comp[0]['content'] for comp in completions]
-        # Check overall structure and if coordinates can be extracted (implies x,y format in answer is somewhat met)
         rewards = []
         for r in responses:
+            # Check if there's both reasoning and answer sections with expected content
             xml_match = bool(self.strict_xml_pattern.match(r))
             coords_extracted = self._extract_coordinates(r) is not None
-            if xml_match and coords_extracted:
-                rewards.append(0.5)
-            elif coords_extracted and not xml_match: # Has x,y but not full XML structure
-                rewards.append(0.1) # Small partial credit for at least getting coordinates
+            
+            # Check for tool usage within reasoning
+            reasoning_content = ""
+            try:
+                reasoning_content = r.split("<reasoning>")[-1].split("</reasoning>")[0]
+                has_click_tool = bool(self.tool_call_pattern.search(reasoning_content))
+                has_check_click = bool(self.check_click_pattern.search(reasoning_content))
+            except IndexError:
+                has_click_tool = False
+                has_check_click = False
+            
+            # Award points based on XML structure and content
+            if xml_match and coords_extracted and has_click_tool and has_check_click:
+                rewards.append(0.5)  # Full credit for perfect format
+            elif coords_extracted and has_click_tool:
+                rewards.append(0.3)  # Partial credit for having coordinates and at least click_tool
+            elif coords_extracted:
+                rewards.append(0.1)  # Minimal credit for having coordinates in any format
             else:
-                rewards.append(0.0)
+                rewards.append(0.0)  # No credit for completely incorrect format
         return rewards
 
     def _click_hit_reward(self, extracted_coords: List[Optional[Tuple[int, int]]], 
@@ -523,6 +582,58 @@ class GUIEvaluator(RewardEvaluator):
             rewards.append(scaled_reward)
             
         return rewards, distance_errors
+        
+    def _tool_usage_reward(self, completions: List[List[Dict[str, str]]], 
+                          click_hit_results: List[bool]) -> List[float]:
+        """
+        Reward for correct usage of tools sequence (click_tool + check_click).
+        
+        This rewards:
+        - +1.0 points: Using check_click after click_tool with correct result True/False 
+        - +0.5 points: Using check_click after click_tool (regardless of response)
+        - +0.0 points: Not using check_click at all
+        
+        Args:
+            completions: List of completion messages
+            click_hit_results: List of boolean values indicating if each click was successful
+            
+        Returns:
+            List of tool usage rewards for each completion
+        """
+        responses = [comp[0]['content'] for comp in completions]
+        rewards = []
+        
+        for response, hit_success in zip(responses, click_hit_results):
+            # Extract reasoning section
+            reasoning_content = ""
+            try:
+                reasoning_content = response.split("<reasoning>")[-1].split("</reasoning>")[0]
+            except IndexError:
+                reasoning_content = response  # Fallback if no tags
+            
+            # Check if check_click tool call is present in reasoning
+            has_check_click = bool(self.check_click_pattern.search(reasoning_content))
+            has_click_tool = bool(self.tool_call_pattern.search(reasoning_content))
+            
+            # Check if tool response is present and correct
+            tool_response_match = self.tool_response_pattern.search(reasoning_content)
+            
+            # Evaluate tool usage in reasoning
+            if has_click_tool and has_check_click and tool_response_match:
+                response_value = tool_response_match.group(1).lower() == 'true'
+                # Maximum reward if check_click used AND response matches actual hit success
+                if response_value == hit_success:
+                    rewards.append(1.0)  # Full reward for correct check_click with matching response
+                else:
+                    rewards.append(0.5)  # Partial reward for using check_click but wrong response
+            elif has_click_tool and has_check_click:
+                rewards.append(0.5)  # Partial reward for using both tools without response
+            elif has_click_tool:
+                rewards.append(0.2)  # Minimal reward for at least using click_tool
+            else:
+                rewards.append(0.0)  # No reward if tools not used properly
+            
+        return rewards
 
     def compute_rewards(
         self,
@@ -548,11 +659,17 @@ class GUIEvaluator(RewardEvaluator):
         
         # 3. Distance to Center Reward
         dist_rewards_scores, raw_distance_errors = self._distance_to_center_reward(extracted_coords_list, target_centers_list, target_bboxes_list)
+        
+        # 4. Tool Usage Reward - compute whether click_tool was used correctly
+        # First convert click scores to boolean success indicators
+        click_hit_bools = [score > 0 for score in click_hit_scores]
+        tool_usage_scores = self._tool_usage_reward(completions, click_hit_bools)
 
         all_component_scores = [
             xml_format_scores,
             click_hit_scores,
-            dist_rewards_scores
+            dist_rewards_scores,
+            tool_usage_scores  # Added the tool usage reward
         ]
         
         for i, scores_component in enumerate(all_component_scores):
@@ -570,6 +687,10 @@ class GUIEvaluator(RewardEvaluator):
         distance_errors_tensor = torch.tensor(raw_distance_errors, dtype=torch.float32, device=device)
         mean_dist_error = distance_errors_tensor.mean().item()
         
+        # Tool Usage Rate
+        num_using_tools_properly = sum(1 for score in tool_usage_scores if score > 0.5)  # Count scores above 0.5 threshold
+        tool_usage_rate = num_using_tools_properly / num_completions if num_completions > 0 else 0.0
+        
         # Total reward mean
         total_reward_mean = rewards_per_func.sum(dim=1).mean().item()
 
@@ -577,9 +698,11 @@ class GUIEvaluator(RewardEvaluator):
             "rewards/xml_format_reward": mean_rewards_per_component[0].item(),
             "rewards/click_hit_reward": mean_rewards_per_component[1].item(),
             "rewards/distance_to_center_reward": mean_rewards_per_component[2].item(),
+            "rewards/tool_usage_reward": mean_rewards_per_component[3].item(), # Add tool usage metric
             "reward": total_reward_mean, # Overall mean reward
             "metrics/click_hit_rate": click_hit_rate,
-            "metrics/mean_distance_to_center_error": mean_dist_error
+            "metrics/mean_distance_to_center_error": mean_dist_error,
+            "metrics/tool_usage_rate": tool_usage_rate  # Add tool usage rate metric
         }
         return rewards_per_func, metrics
 
@@ -590,6 +713,7 @@ class GUIEvaluator(RewardEvaluator):
                 'xml_format': reward_scores[0].item(),
                 'click_hit': reward_scores[1].item(),
                 'distance_to_center': reward_scores[2].item(),
+                'tool_usage': reward_scores[3].item(), # Added tool usage reward
             }
         elif reward_scores.ndim == 2 and reward_scores.shape[1] == self.num_reward_functions:
             # For batch tensor, return for the first item (or mean if preferred)
@@ -597,7 +721,8 @@ class GUIEvaluator(RewardEvaluator):
                 'xml_format': reward_scores[0, 0].item(),
                 'click_hit': reward_scores[0, 1].item(),
                 'distance_to_center': reward_scores[0, 2].item(),
+                'tool_usage': reward_scores[0, 3].item(), # Added tool usage reward
             }
         else:
             # print(f"Warning: Unexpected shape for reward_scores in GUIEvaluator.get_reward_breakdown: {reward_scores.shape}")
-            return {'xml_format': 0.0, 'click_hit': 0.0, 'distance_to_center': 0.0}
+            return {'xml_format': 0.0, 'click_hit': 0.0, 'distance_to_center': 0.0, 'tool_usage': 0.0} # Added tool usage
