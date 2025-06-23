@@ -5,14 +5,34 @@ import os
 import json
 import torch
 import argparse
+import torch.nn.functional as F
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
+from typing import Union, List, Tuple, Optional
+from dataclasses import dataclass
 
 import llms
 import utils
 import evaluator
 import rldatasets
+
+@dataclass
+class SoftToken:
+    """Represents a soft token with weighted embeddings and probabilities"""
+    token_ids: torch.Tensor  # [k] top-k token IDs
+    probs: torch.Tensor      # [k] probabilities for each token
+    embedding: torch.Tensor  # [hidden_dim] weighted embedding
+    most_likely_id: int      # ID of most likely token (for readability)
+    
+    def to(self, device):
+        """Move tensors to device"""
+        return SoftToken(
+            token_ids=self.token_ids.to(device),
+            probs=self.probs.to(device), 
+            embedding=self.embedding.to(device),
+            most_likely_id=self.most_likely_id
+        )
 
 def eval_on_test_set(
     model: PreTrainedModel,
@@ -81,12 +101,17 @@ def eval_on_test_set(
             f.write("\n" + "="*50 + "\n")
             f.write(f"Q# {num_examples}\n")
             f.write(f"Question: {question}\n")
-            f.write(f"Response: {completions_text[0]}\n") # Log first completion
+            
+            # Log all completions
+            for i, completion in enumerate(completions_text):
+                f.write(f"Response {i+1}: {completion}\n")
+            
             f.write(f"Ground Truth: {answer}\n")
             f.write("Metrics:\n")
             for metric, value in metrics.items():
                 f.write(f"{metric}: {value}\n")
             f.write(f"Total Score: {rewards_per_func.sum().item()}\n")
+
 
 
     # Calculate averages
@@ -114,9 +139,42 @@ def generate_completions(
     question: str,
     device: str,
     args: argparse.Namespace
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], str]:
+) -> tuple[Union[torch.Tensor, List[Union[torch.Tensor, SoftToken]]], torch.Tensor, Union[torch.Tensor, List[Union[torch.Tensor, SoftToken]]], torch.Tensor, list[str], str]:
     """
     Generate multiple completion sequences for a given prompt using a language model.
+    Routes to either normal generation or soft thinking generation based on args.
+    
+    Args:
+        model: The language model to use for generation
+        tokenizer: Tokenizer corresponding to the model
+        question: The input question/prompt to generate completions for
+        device: Device to run generation on ('cpu' or 'cuda')
+        args: Namespace containing generation parameters
+        
+    Returns:
+        prompt_completion_ids: Tensor (normal) or List[Union[Tensor, SoftToken]] (soft thinking)
+        prompt_ids: Tensor containing just the prompt token IDs
+        completion_ids: Tensor (normal) or List[Union[Tensor, SoftToken]] (soft thinking)
+        attention_mask: Attention mask tensor for the full sequence
+        completions_text: List of decoded completion texts
+        prompt_text: The full formatted prompt text
+    """
+    if args.soft_thinking:
+        return generate_completions_soft_thinking(model, tokenizer, question, device, args)
+    else:
+        return generate_completions_normal(model, tokenizer, question, device, args)
+
+
+def generate_completions_normal(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase, 
+    question: str,
+    device: str,
+    args: argparse.Namespace
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], str]:
+    """
+    Generate multiple completion sequences using normal (non-soft thinking) generation.
+    This is the original generation function.
     
     Args:
         model: The language model to use for generation
@@ -134,11 +192,13 @@ def generate_completions(
         prompt_text: The full formatted prompt text
     """
     # 1. Prepare prompting
+    # Import the system prompt
+    from rldatasets import SYSTEM_PROMPT
     prompt = [
-        {'role': 'system', 'content': train_loader.system_prompt},
+        {'role': 'system', 'content': SYSTEM_PROMPT},
         {'role': 'user', 'content': question}
     ]
-    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False)
+    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
     prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
@@ -187,7 +247,7 @@ def generate_completions(
     completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
     return prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text
-    
+
 def score_completions(
     completions_text: list[str],
     question: str,
@@ -270,6 +330,51 @@ def score_completions(
 def compute_loss(
     model: PreTrainedModel,
     base_model: PreTrainedModel, 
+    prompt_completion_ids: Union[torch.Tensor, List[List[Union[torch.Tensor, SoftToken]]]],
+    prompt_ids: torch.Tensor,
+    completion_ids: Union[torch.Tensor, List[List[Union[torch.Tensor, SoftToken]]]],
+    attention_mask: torch.Tensor,
+    completion_mask: Optional[torch.Tensor],
+    advantages: torch.Tensor,
+    args: argparse.Namespace
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    Compute the GRPO loss between current and base model.
+    Routes to appropriate loss function based on whether using soft thinking.
+    
+    Args:
+        model: The current model being trained
+        base_model: The reference model to compare against
+        prompt_completion_ids: Combined prompt and completion token IDs (tensor or list of mixed tokens)
+        prompt_ids: Token IDs for just the prompt
+        completion_ids: Token IDs for just the completion (tensor or list of mixed tokens)
+        attention_mask: Attention mask for the full sequence
+        completion_mask: Mask indicating which tokens are from the completion (for normal mode)
+        advantages: Advantage values for each sequence
+        args: Training arguments
+        
+    Returns:
+        loss: The computed GRPO loss
+        metrics: Dictionary containing additional metrics like KL divergence
+    """
+    # Check if we're using soft thinking based on data types
+    if isinstance(completion_ids, list) and len(completion_ids) > 0 and isinstance(completion_ids[0], list):
+        # Soft thinking mode
+        return compute_loss_soft_thinking(
+            model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
+            attention_mask, advantages, args
+        )
+    else:
+        # Normal mode
+        return compute_loss_normal(
+            model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
+            attention_mask, completion_mask, advantages, args
+        )
+
+
+def compute_loss_normal(
+    model: PreTrainedModel,
+    base_model: PreTrainedModel, 
     prompt_completion_ids: torch.Tensor,
     prompt_ids: torch.Tensor,
     completion_ids: torch.Tensor,
@@ -279,7 +384,8 @@ def compute_loss(
     args: argparse.Namespace
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    Compute the GRPO loss between current and base model.
+    Compute the GRPO loss between current and base model for normal (non-soft thinking) generation.
+    This is the original compute_loss function.
     
     Args:
         model: The current model being trained
@@ -371,18 +477,493 @@ def grpo_loss(
     log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
     utils.write_generation_log(log_data, log_file)
 
-    # Compute loss
-    completion_mask = attention_mask[:, prompt_ids.size(1):]
-    loss, loss_metrics = compute_loss(
-        model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
-        attention_mask, completion_mask, advantages, args
-    )
+    # Compute loss - handle different generation modes
+    if args.soft_thinking:
+        # Soft thinking mode - completion_mask not needed
+        loss, loss_metrics = compute_loss(
+            model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
+            attention_mask, None, advantages, args
+        )
+    else:
+        # Normal mode - compute completion_mask as before
+        completion_mask = attention_mask[:, prompt_ids.size(1):]
+        loss, loss_metrics = compute_loss(
+            model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
+            attention_mask, completion_mask, advantages, args
+        )
 
     # Combine metrics
     metrics.update(loss_metrics)
 
     return loss, metrics
 
+def generate_completions_soft_thinking(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    question: str,
+    device: str,
+    args: argparse.Namespace
+) -> tuple[List[Union[torch.Tensor, SoftToken]], torch.Tensor, List[Union[torch.Tensor, SoftToken]], torch.Tensor, list[str], str]:
+    """
+    Generate completions using soft thinking - weighted mixtures of top-k token embeddings.
+    
+    Args:
+        model: The language model to use for generation
+        tokenizer: Tokenizer corresponding to the model
+        question: The input question/prompt to generate completions for
+        device: Device to run generation on ('cpu' or 'cuda')
+        args: Namespace containing generation parameters
+        
+    Returns:
+        prompt_completion_sequence: List of tokens (hard tokens + soft tokens)
+        prompt_ids: Tensor containing just the prompt token IDs  
+        completion_sequence: List of completion tokens (mix of hard and soft)
+        attention_mask: Attention mask tensor for the full sequence
+        completions_text: List of decoded completion texts (using most likely tokens)
+        prompt_text: The full formatted prompt text
+    """
+    # 1. Prepare prompting (same as before)
+    # Import the system prompt
+    from rldatasets import SYSTEM_PROMPT
+    prompt = [
+        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'user', 'content': question}
+    ]
+    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+
+    prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
+    prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+    # Debug: Check tokenizer output
+    if args.verbose:
+        print(f"Tokenizer output:")
+        print(f"  prompt_ids shape: {prompt_ids.shape}")
+        print(f"  prompt_mask shape: {prompt_mask.shape}")
+
+    # Truncate prompt to max length and repeat for number of generations
+    prompt_ids = prompt_ids[:, -args.max_prompt_length:]
+    prompt_mask = prompt_mask[:, -args.max_prompt_length:]
+    
+    # Debug: Check after truncation
+    if args.verbose:
+        print(f"After truncation:")
+        print(f"  prompt_ids shape: {prompt_ids.shape}")
+        print(f"  prompt_mask shape: {prompt_mask.shape}")
+    
+    # Repeat for number of chains/generations
+    prompt_ids = prompt_ids.repeat(args.num_chains, 1)
+    prompt_mask = prompt_mask.repeat(args.num_chains, 1)
+    
+    # Debug: Check after repeat
+    if args.verbose:
+        print(f"After repeat (num_chains={args.num_chains}):")
+        print(f"  prompt_ids shape: {prompt_ids.shape}")
+        print(f"  prompt_mask shape: {prompt_mask.shape}")
+
+    # Move to device
+    prompt_ids = prompt_ids.to(device)
+    prompt_mask = prompt_mask.to(device)
+    
+    # Get model's embedding layer
+    embed_layer = model.get_input_embeddings()
+    
+    # Get special token IDs
+    reasoning_end_ids = tokenizer.encode("</reasoning>", add_special_tokens=False)
+    eos_token_id = tokenizer.eos_token_id
+    
+    # Initialize for generation
+    batch_size = args.num_chains
+    current_ids = prompt_ids  # [batch_size, prompt_len]
+    current_attention_mask = prompt_mask  # [batch_size, prompt_len]
+    
+    # Debug: Check initial dimensions
+    if args.verbose:
+        print(f"Initialized soft thinking generation:")
+        print(f"  batch_size: {batch_size}")
+        print(f"  prompt_ids shape: {prompt_ids.shape}")
+        print(f"  prompt_mask shape: {prompt_mask.shape}")
+    
+    # Track completion sequences for each chain
+    completion_sequences = [[] for _ in range(batch_size)]
+    most_likely_sequences = [[] for _ in range(batch_size)]  # For decoding
+    
+    # Generation loop
+    for step in range(args.max_completion_length):
+        # Get model outputs for current sequence
+        with torch.no_grad():
+            # For the current step, we need to handle mixed hard/soft tokens
+            if step == 0:
+                # First step - use hard tokens (prompt)
+                outputs = model(input_ids=current_ids, attention_mask=current_attention_mask)
+            else:
+                # For subsequent steps, we need to construct inputs with soft embeddings
+                # Process all sequences in parallel for proper batching
+                inputs_embeds = []
+                attention_masks = []
+                
+                for batch_idx in range(batch_size):
+                    # Get embeddings for this batch item
+                    prompt_embeds = embed_layer(current_ids[batch_idx:batch_idx+1])  # [1, prompt_len, hidden]
+                    
+                    # Add soft token embeddings from previous steps
+                    batch_embeds = [prompt_embeds.squeeze(0)]  # [prompt_len, hidden]
+                    for soft_token in completion_sequences[batch_idx]:
+                        if isinstance(soft_token, SoftToken):
+                            # Soft token embedding
+                            soft_embed = soft_token.embedding.unsqueeze(0)  # [1, hidden]
+                            batch_embeds.append(soft_embed)
+                        else:
+                            # Hard token - ensure consistent tensor handling
+                            if isinstance(soft_token, torch.Tensor):
+                                if soft_token.dim() == 0:
+                                    # Scalar tensor
+                                    token_id = soft_token.unsqueeze(0)  # [1]
+                                elif soft_token.dim() == 1:
+                                    # Already 1D
+                                    token_id = soft_token  # [1] or [n]
+                                else:
+                                    # Take first element if multi-dimensional
+                                    token_id = soft_token.flatten()[:1]  # [1]
+                            else:
+                                # Convert to tensor if needed
+                                token_id = torch.tensor([soft_token], device=device)
+                            
+                            hard_embed = embed_layer(token_id.unsqueeze(0))  # [1, len, hidden]
+                            # Squeeze to get [len, hidden], then take first token [1, hidden]
+                            hard_embed = hard_embed.squeeze(0)  # [len, hidden]
+                            if hard_embed.dim() == 2 and hard_embed.size(0) > 1:
+                                hard_embed = hard_embed[:1]  # Take first token: [1, hidden]
+                            elif hard_embed.dim() == 1:
+                                hard_embed = hard_embed.unsqueeze(0)  # [1, hidden]
+                            batch_embeds.append(hard_embed)
+                    
+                    full_embeds = torch.cat(batch_embeds, dim=0)  # [total_len, hidden]
+                    inputs_embeds.append(full_embeds)
+
+                # Pad to same length and stack - this is crucial for proper batching
+                max_len = max(embeds.size(0) for embeds in inputs_embeds)
+                padded_embeds = []
+                
+                for embeds in inputs_embeds:
+                    pad_len = max_len - embeds.size(0)
+                    if pad_len > 0:
+                        pad_embeds = torch.zeros(pad_len, embeds.size(1), device=device, dtype=embeds.dtype)
+                        embeds = torch.cat([pad_embeds, embeds], dim=0)
+                    padded_embeds.append(embeds)
+                    
+                    # Create attention mask
+                    attention_mask = torch.ones(max_len, device=device)
+                    if pad_len > 0:
+                        attention_mask[:pad_len] = 0
+                    attention_masks.append(attention_mask)
+                
+                # Stack to create proper batch dimensions
+                inputs_embeds = torch.stack(padded_embeds)  # [batch_size, max_len, hidden]
+                current_attention_mask = torch.stack(attention_masks)  # [batch_size, max_len]
+                
+                # Verify batch dimensions before forward pass
+                if inputs_embeds.size(0) != batch_size:
+                    print(f"Warning: inputs_embeds batch size {inputs_embeds.size(0)} != expected {batch_size}")
+                
+                outputs = model(inputs_embeds=inputs_embeds, attention_mask=current_attention_mask)
+        
+        # Get logits for next token
+        logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+        
+        # Debug: Check dimensions
+        if step < 2 and args.verbose:
+            print(f"Step {step}: outputs.logits shape: {outputs.logits.shape}")
+            print(f"Step {step}: logits shape: {logits.shape}")
+        
+        # Apply temperature
+        logits = logits / args.temperature
+        
+        # Get probabilities
+        probs = F.softmax(logits, dim=-1)  # [batch_size, vocab_size]
+        
+        # Debug: Check probability dimensions
+        if step < 2 and args.verbose:
+            print(f"Step {step}: probs shape: {probs.shape}, expected batch_size: {batch_size}")
+        
+        # Check if we should exit soft thinking mode for any sequence
+        # (when </reasoning> is the most likely token)
+        most_likely_tokens = torch.argmax(probs, dim=-1)  # [batch_size]
+        
+        # Generate next tokens for each sequence
+        next_tokens = []
+        
+
+        for batch_idx in range(batch_size):
+            batch_probs = probs[batch_idx]
+            most_likely_id = most_likely_tokens[batch_idx].item()
+            
+            # Check if we should exit soft thinking - either EOS or if last tokens match </reasoning>
+            sequence_so_far = most_likely_sequences[batch_idx]
+            should_exit = (most_likely_id == eos_token_id or 
+                          (len(sequence_so_far) >= len(reasoning_end_ids) and 
+                           sequence_so_far[-len(reasoning_end_ids):] == reasoning_end_ids))
+            
+            if should_exit:
+                # Switch to hard token generation
+                sampled_id = torch.multinomial(batch_probs, 1).item()
+                # Store as scalar tensor for consistency
+                next_tokens.append(torch.tensor(sampled_id, device=device))
+                most_likely_sequences[batch_idx].append(sampled_id)
+
+            else:
+                # Continue with soft thinking - create mixed token
+                # Sample k tokens from distribution for diversity
+                top_ids = torch.multinomial(batch_probs, args.soft_thinking_k)
+                top_probs = batch_probs[top_ids]
+                
+                # Normalize probabilities
+                top_probs = top_probs / top_probs.sum()
+
+                
+                # Get embeddings for top-k tokens
+                top_embeddings = embed_layer(top_ids)  # [k, hidden_dim]
+                
+                # Create weighted embedding
+                weighted_embedding = torch.sum(top_probs.unsqueeze(-1) * top_embeddings, dim=0)  # [hidden_dim]
+                
+                # Create soft token
+                soft_token = SoftToken(
+                    token_ids=top_ids,
+                    probs=top_probs,
+                    embedding=weighted_embedding,
+                    most_likely_id=most_likely_id
+                )
+                
+                next_tokens.append(soft_token)
+                most_likely_sequences[batch_idx].append(most_likely_id)
+                if args.verbose and step < 3 and batch_idx == 0:  # Only print for first chain and first few steps
+                    decoded_tokens = [tokenizer.decode([tid.item()]) for tid in top_ids]
+                    print(f"Step {step}, Chain {batch_idx}: Soft thinking, top-{args.soft_thinking_k} tokens: {decoded_tokens}, probs: {top_probs.tolist()}")
+        
+        # Add tokens to completion sequences
+        for batch_idx, token in enumerate(next_tokens):
+            completion_sequences[batch_idx].append(token)
+        
+        # Check for early stopping (all sequences hit EOS or reasoning end)
+        all_finished = True
+        for batch_idx in range(batch_size):
+            sequence_so_far = most_likely_sequences[batch_idx]
+            if len(sequence_so_far) == 0:
+                all_finished = False
+                break
+            
+            last_token_id = sequence_so_far[-1]
+            sequence_ended = (last_token_id == eos_token_id or 
+                            (len(sequence_so_far) >= len(reasoning_end_ids) and 
+                             sequence_so_far[-len(reasoning_end_ids):] == reasoning_end_ids))
+            
+            if not sequence_ended:
+                all_finished = False
+                break
+        
+        if all_finished:
+            break
+    
+    # Convert most likely sequences to text for evaluation
+    completions_text = []
+    for seq in most_likely_sequences:
+        if seq:  # Check if sequence is not empty
+            try:
+                text = tokenizer.decode(seq, skip_special_tokens=True)
+                completions_text.append(text)
+            except:
+                # Fallback in case of decoding issues
+                completions_text.append("")
+        else:
+            completions_text.append("")
+    
+    # Create combined sequences (prompt + completion)
+    prompt_completion_sequences = []
+    for batch_idx in range(batch_size):
+        # Convert prompt to list of hard tokens
+        prompt_tokens = [prompt_ids[batch_idx, i] for i in range(prompt_ids.size(1))]
+        combined_seq = prompt_tokens + completion_sequences[batch_idx]
+        prompt_completion_sequences.append(combined_seq)
+    
+    # Create attention masks (simplified - assume all tokens are attended to)
+    max_total_len = max(len(seq) for seq in prompt_completion_sequences)
+    attention_mask = torch.ones(batch_size, max_total_len, device=device)
+    
+    return prompt_completion_sequences, prompt_ids, completion_sequences, attention_mask, completions_text, prompt_text
+
+def compute_loss_soft_thinking(
+    model: PreTrainedModel,
+    base_model: PreTrainedModel,
+    prompt_completion_sequences: List[List[Union[torch.Tensor, SoftToken]]],
+    prompt_ids: torch.Tensor,
+    completion_sequences: List[List[Union[torch.Tensor, SoftToken]]],
+    attention_mask: torch.Tensor,
+    advantages: torch.Tensor,
+    args: argparse.Namespace
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    Compute the GRPO loss for soft thinking generation.
+    
+    Args:
+        model: The current model being trained
+        base_model: The reference model to compare against
+        prompt_completion_sequences: List of mixed token sequences (prompt + completion)
+        prompt_ids: Tensor containing just the prompt token IDs
+        completion_sequences: List of completion sequences with mixed tokens
+        attention_mask: Attention mask tensor
+        advantages: Advantage values for each sequence
+        args: Training arguments
+        
+    Returns:
+        loss: The computed GRPO loss
+        metrics: Dictionary containing additional metrics like KL divergence
+    """
+    device = prompt_ids.device
+    batch_size = len(completion_sequences)
+    
+    # We need to compute loss for each sequence individually due to mixed tokens
+    total_loss = 0.0
+    total_kl = 0.0
+    total_response_length = 0.0
+    
+    embed_layer = model.get_input_embeddings()
+    
+    for batch_idx in range(batch_size):
+        completion_seq = completion_sequences[batch_idx]
+        if not completion_seq:  # Skip empty sequences
+            continue
+            
+        # Build input embeddings for this sequence
+        prompt_embeds = embed_layer(prompt_ids[batch_idx:batch_idx+1])  # [1, prompt_len, hidden]
+        sequence_embeds = [prompt_embeds.squeeze(0)]  # [prompt_len, hidden]
+        
+        # Track positions of soft vs hard tokens for loss computation
+        completion_positions = []
+        completion_targets = []  # For hard tokens
+        completion_soft_targets = []  # For soft tokens
+        
+        for pos, token in enumerate(completion_seq):
+            if isinstance(token, SoftToken):
+                sequence_embeds.append(token.embedding.unsqueeze(0))  # [1, hidden]
+                completion_positions.append(len(sequence_embeds) - 1)
+                completion_targets.append(None)  # No single target for soft token
+                completion_soft_targets.append(token)
+            else:
+                # Hard token
+                hard_embed = embed_layer(token.unsqueeze(0).unsqueeze(0))  # [1, 1, hidden]
+                sequence_embeds.append(hard_embed.squeeze(0))  # [1, hidden]
+                completion_positions.append(len(sequence_embeds) - 1)
+                completion_targets.append(token.item())
+                completion_soft_targets.append(None)
+        
+        if not completion_positions:  # No completion tokens
+            continue
+            
+        # Concatenate embeddings and get model outputs
+        full_embeds = torch.cat(sequence_embeds, dim=0).unsqueeze(0)  # [1, total_len, hidden]
+        seq_attention_mask = torch.ones(1, full_embeds.size(1), device=device)
+        
+        # Get model outputs
+        outputs = model(inputs_embeds=full_embeds, attention_mask=seq_attention_mask)
+        logits = outputs.logits.squeeze(0)  # [total_len, vocab_size]
+        
+        # Get reference model outputs for KL computation
+        with torch.inference_mode():
+            ref_outputs = base_model(inputs_embeds=full_embeds, attention_mask=seq_attention_mask)
+            ref_logits = ref_outputs.logits.squeeze(0)  # [total_len, vocab_size]
+        
+        # Compute per-token losses and KL divergences
+        token_losses = []
+        token_kls = []
+        
+        for i, pos in enumerate(completion_positions):
+            if pos >= logits.size(0) - 1:  # Skip if position is out of bounds
+                continue
+                
+            # Get logits for next token prediction (logits at position pos predict token at pos+1)
+            current_logits = logits[pos - 1]  # [vocab_size] - predict token at current position
+            ref_current_logits = ref_logits[pos - 1]  # [vocab_size]
+            
+            # Apply temperature
+            current_logits = current_logits / args.temperature
+            ref_current_logits = ref_current_logits / args.temperature
+            
+            # Get probabilities
+            current_probs = F.softmax(current_logits, dim=-1)
+            ref_current_probs = F.softmax(ref_current_logits, dim=-1)
+            
+            # Compute loss based on token type
+            if completion_targets[i] is not None:
+                # Hard token - standard cross-entropy loss
+                target_id = completion_targets[i]
+                per_token_logp = F.log_softmax(current_logits, dim=-1)[target_id]
+                ref_per_token_logp = F.log_softmax(ref_current_logits, dim=-1)[target_id]
+                
+                # KL divergence for this token
+                kl = torch.exp(ref_per_token_logp - per_token_logp) - (ref_per_token_logp - per_token_logp) - 1
+                
+                # GRPO loss
+                token_loss = torch.exp(per_token_logp - per_token_logp.detach()) * advantages[batch_idx]
+                token_loss = -(token_loss - args.kl_weight_beta * kl)
+                
+            else:
+                # Soft token - weighted loss over top-k tokens
+                soft_token = completion_soft_targets[i]
+                token_ids = soft_token.token_ids
+                token_probs = soft_token.probs
+                
+                # Compute weighted loss
+                weighted_loss = 0.0
+                weighted_kl = 0.0
+                
+                for j, (token_id, prob) in enumerate(zip(token_ids, token_probs)):
+                    # Log probability for this token
+                    per_token_logp = F.log_softmax(current_logits, dim=-1)[token_id]
+                    ref_per_token_logp = F.log_softmax(ref_current_logits, dim=-1)[token_id]
+                    
+                    # KL divergence for this token
+                    kl = torch.exp(ref_per_token_logp - per_token_logp) - (ref_per_token_logp - per_token_logp) - 1
+                    
+                    # GRPO loss for this token
+                    token_loss = torch.exp(per_token_logp - per_token_logp.detach()) * advantages[batch_idx]
+                    token_loss = -(token_loss - args.kl_weight_beta * kl)
+                    
+                    # Weight by probability
+                    weighted_loss += prob * token_loss
+                    weighted_kl += prob * kl
+                
+                token_loss = weighted_loss
+                kl = weighted_kl
+            
+            token_losses.append(token_loss)
+            token_kls.append(kl)
+        
+        # Aggregate losses for this sequence
+        if token_losses:
+            sequence_loss = torch.stack(token_losses).mean()
+            sequence_kl = torch.stack(token_kls).mean()
+            
+            total_loss += sequence_loss
+            total_kl += sequence_kl
+            total_response_length += len(token_losses)
+    
+    # Average across batch
+    if batch_size > 0:
+        loss = total_loss / batch_size
+        mean_kl = total_kl / batch_size
+        mean_response_length = total_response_length / batch_size
+    else:
+        loss = torch.tensor(0.0, device=device)
+        mean_kl = torch.tensor(0.0, device=device)
+        mean_response_length = 0.0
+    
+    # Additional metrics
+    metrics = {
+        "response_length": mean_response_length,
+        "kl": mean_kl.item() if isinstance(mean_kl, torch.Tensor) else mean_kl
+    }
+    
+    return loss, metrics
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
@@ -396,7 +977,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--save_steps", type=int, default=100, help="Save model every N steps")
-    parser.add_argument("--eval_iterations", type=int, default=20, help="Number of iterations for evaluation")
+    parser.add_argument("--eval_iterations", type=int, default=50, help="Number of iterations for evaluation")
 
     # Optimization hyperparameters
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
@@ -422,6 +1003,11 @@ def parse_args():
     parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
     parser.add_argument("--seed", type=int, default=7111994, help="Random seed")
 
+    # Soft thinking parameters
+    parser.add_argument("--soft_thinking", action="store_true", help="Enable soft thinking mode with weighted token embeddings")
+    parser.add_argument("--soft_thinking_k", type=int, default=2, help="Number of top-k tokens to mix in soft thinking")
+    parser.add_argument("--soft_thinking_temperature", type=float, default=1.0, help="Temperature for soft thinking probability mixing")
+
     args = parser.parse_args()
     return args
 
@@ -436,7 +1022,16 @@ if __name__ == "__main__":
     # Set device and enable bf16
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-    torch.set_float32_matmul_precision('high') 
+    torch.set_float32_matmul_precision('high')
+    
+    # Print mode information
+    if args.soft_thinking:
+        print(f"🧠 SOFT THINKING MODE ENABLED")
+        print(f"   - Top-k tokens: {args.soft_thinking_k}")
+        print(f"   - Soft thinking temperature: {args.soft_thinking_temperature}")
+        print(f"   - Will exit soft thinking when </reasoning> is most likely")
+    else:
+        print("🔢 NORMAL GENERATION MODE") 
 
     ###############################
     ## Main Experiment settings ##

@@ -37,6 +37,66 @@ Handles dataset loading and preprocessing, currently focused on GSM8K math probl
 ### evaluator.py
 Contains evaluation metrics and reward functions, closely following DeepSeek's original implementation.
 
+### token_analysis.py
+Provides detailed analysis of token probability distributions during single inference traces. Analyzes entropy patterns, token consistency, and probability landscapes to understand model behavior during generation.
+
+## Token Probability Analysis
+Explore model behavior during inference:
+```bash
+# Analyze token distributions for a single reasoning trace
+python token_analysis.py --output_dir "analysis_results"
+
+# Or use the convenience script
+./run_token_analysis.sh
+```
+
+This generates comprehensive visualizations including:
+- Entropy evolution during generation
+- Top-k token probability heatmaps  
+- Token consistency analysis
+- Probability landscape visualization
+- Individual token PDFs (one plot per generated token showing full probability distribution)
+
+For faster analysis, skip the individual PDFs:
+```bash
+python token_analysis.py --output_dir "fast_analysis" --skip_individual_pdfs
+```
+
+## Soft Thinking Mode 🧠
+
+This implementation includes an experimental "soft thinking" feature inspired by recent research on preserving information during token generation. Instead of always sampling a single token from the probability distribution (which can lose information), soft thinking:
+
+1. **Samples top-k tokens** with their probabilities
+2. **Creates weighted embeddings** by mixing the top-k token embeddings based on their probabilities  
+3. **Feeds mixed embeddings** to the next layer, preserving the superposition of likely tokens
+4. **Exits to normal generation** when `</reasoning>` becomes the most likely token
+
+### Usage
+
+Enable soft thinking mode:
+```bash
+# Basic soft thinking (top-2 tokens)
+python main.py --soft_thinking
+
+# Customize parameters
+python main.py --soft_thinking --soft_thinking_k 3 --soft_thinking_temperature 1.2
+```
+
+### Parameters
+
+- `--soft_thinking`: Enable soft thinking mode
+- `--soft_thinking_k`: Number of top tokens to mix (default: 2)
+- `--soft_thinking_temperature`: Temperature for probability mixing (default: 1.0)
+
+### Testing
+
+Test both generation modes:
+```bash
+python test_soft_thinking.py
+```
+
+This will verify that both normal and soft thinking generation work correctly and show the differences in token handling.
+
 ## Results
 Training was conducted on a single H100 GPU. After ~400 training steps:
 
