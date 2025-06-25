@@ -8,6 +8,7 @@ import argparse
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
+from typing import Any
 
 import llms
 import utils
@@ -67,14 +68,17 @@ def eval_on_test_set(
                 prompts=mock_prompts,
                 completions=mock_completions, 
                 answer=answers,
-                device=device
+                device=device,
+                tokenizer=tokenizer
             )
             
             # Track accuracy and accumulate metrics
             total_accuracy += metrics['accuracy']
                 
             for k, v in metrics.items():
-                total_scores[k] += v
+                # Skip per-completion data that shouldn't be averaged
+                if k != 'unique_token_counts':
+                    total_scores[k] += v
             num_examples += 1
 
             # Log this example
@@ -103,7 +107,10 @@ def eval_on_test_set(
         print("-" * 20)
         print(f"Accuracy: {accuracy:.2f}%")
         for metric, value in avg_scores.items():
-            print(f"{metric:15s}: {value:.4f}")
+            if metric == 'avg_unique_tokens' and args.conciseness:
+                print(f"{metric:25s}: {value:.1f} tokens")
+            elif metric != 'avg_unique_tokens':
+                print(f"{metric:25s}: {value:.4f}")
         print("-" * 20)
 
     return avg_scores, accuracy
@@ -194,6 +201,7 @@ def score_completions(
     answer: str,
     eval_class: evaluator.RewardEvaluator,
     device: str,
+    tokenizer: Any,
     args: argparse.Namespace
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], dict]:
     """
@@ -233,18 +241,21 @@ def score_completions(
         prompts=mock_prompts,
         completions=mock_completions,
         answer=answers,
-        device=device
+        device=device,
+        tokenizer=tokenizer
     )
     rewards = rewards_per_func.sum(dim=1)
 
     # Store generation data
+    unique_token_counts = metrics.get('unique_token_counts', [0] * len(completions_text))
     for i, (completion, reward_scores) in enumerate(zip(completions_text, rewards_per_func)):
         generation_data = {
             'response': completion,
             'scores': {
                 **eval_class.get_reward_breakdown(reward_scores),
                 'total_reward': rewards[i].item()
-            }
+            },
+            'unique_tokens': unique_token_counts[i]
         }
         log_data['generations'].append(generation_data)
 
@@ -262,7 +273,8 @@ def score_completions(
     log_data['summary_stats'] = {
         'mean_rewards_per_group': mean_grouped_rewards.tolist(),
         'std_rewards_per_group': std_grouped_rewards.tolist(),
-        'advantages': advantages.tolist()
+        'advantages': advantages.tolist(),
+        'avg_unique_tokens': metrics.get('avg_unique_tokens', 0.0)
     }
 
     return rewards, advantages, rewards_per_func, metrics, log_data
@@ -364,7 +376,7 @@ def grpo_loss(
 
     # Score completions
     rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
-        completions_text, question, answer, eval_class, device, args
+        completions_text, question, answer, eval_class, device, tokenizer, args
     )
 
     # Write log data
@@ -421,6 +433,7 @@ def parse_args():
     parser.add_argument("--num_train_iters", type=int, default=1000, help="Number of training iterations")
     parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
     parser.add_argument("--seed", type=int, default=7111994, help="Random seed")
+    parser.add_argument("--conciseness", action="store_true", help="Enable conciseness reward for fewer unique tokens")
 
     args = parser.parse_args()
     return args
@@ -450,7 +463,7 @@ if __name__ == "__main__":
     train_loader, test_loader = rldatasets.get_dataloaders(args.dataset_name)
 
     ## Set which evaluation criteria to use 
-    eval_class = evaluator.get_evaluator(args.evaluator)
+    eval_class = evaluator.get_evaluator(args.evaluator, use_conciseness=args.conciseness)
 
     ###############################
 

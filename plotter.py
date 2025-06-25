@@ -46,6 +46,7 @@ def plot_metrics(output_dir):
             'rewards/strict_format_reward_func',
             'rewards/soft_format_reward_func',
             'rewards/xmlcount_reward_func',
+            'rewards/conciseness_reward_func',
             'reward'
         ]
         
@@ -103,6 +104,25 @@ def plot_metrics(output_dir):
         plt.legend()
         pdf.savefig(bbox_inches='tight')
         plt.close()
+
+        # Plot average unique tokens (if available)
+        if 'avg_unique_tokens' in train_logs[steps[0]]:
+            plt.figure(figsize=(12,7))
+            avg_tokens = [metrics.get('avg_unique_tokens', 0) for metrics in train_logs.values()]
+
+            plt.plot(steps, avg_tokens, color='#e67e22', alpha=0.3, linewidth=1.5, label='Avg Unique Tokens (Raw)')
+            if len(avg_tokens) > 5:
+                ma_tokens = moving_average(avg_tokens)
+                ma_steps = steps[len(steps)-len(ma_tokens):]
+                plt.plot(ma_steps, ma_tokens, color='#e67e22', linewidth=2.5, label='Avg Unique Tokens (MA)')
+
+            plt.xlabel('Training Steps', fontsize=12)
+            plt.ylabel('Average Unique Tokens', fontsize=12)
+            plt.title('Average Unique Tokens in Training', fontsize=14, pad=20)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            pdf.savefig(bbox_inches='tight')
+            plt.close()
 
         # Plot loss
         plt.figure(figsize=(12,7))
@@ -163,8 +183,15 @@ def plot_metrics(output_dir):
                 metric_values = [eval_logs[step]['metrics'][metric] for step in eval_steps]
                 plt.plot(eval_steps, metric_values, color=color, linewidth=2.0, label=metric)
                 plt.xlabel('Training Steps', fontsize=12)
-                plt.ylabel(metric.replace('_', ' ').title(), fontsize=12)
-                plt.title(f'Evaluation {metric.replace("_", " ").title()}', fontsize=14, pad=20)
+                
+                # Special formatting for unique tokens
+                if metric == 'avg_unique_tokens':
+                    plt.ylabel('Average Unique Tokens', fontsize=12)
+                    plt.title('Average Unique Tokens in Reasoning', fontsize=14, pad=20)
+                else:
+                    plt.ylabel(metric.replace('_', ' ').title(), fontsize=12)
+                    plt.title(f'Evaluation {metric.replace("_", " ").title()}', fontsize=14, pad=20)
+                
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 pdf.savefig(bbox_inches='tight')

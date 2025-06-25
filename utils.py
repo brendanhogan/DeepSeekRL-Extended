@@ -68,6 +68,8 @@ def write_generation_log(log_data: Dict[str, Any], log_file: str) -> None:
             f.write(f"Strict format: {gen['scores']['strict_format']}\n")
             f.write(f"Soft format: {gen['scores']['soft_format']}\n")
             f.write(f"XML count: {gen['scores']['xml_count']}\n")
+            f.write(f"Conciseness: {gen['scores']['conciseness']}\n")
+            f.write(f"Unique tokens: {gen.get('unique_tokens', 0)}\n")
             f.write(f"Total reward: {gen['scores']['total_reward']}\n\n")
 
 

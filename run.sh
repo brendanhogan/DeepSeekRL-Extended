@@ -1,2 +1,2 @@
-# python main.py --output_dir "final1" --verbose
-python plotter.py --log_dir "final1"
+python main.py --output_dir "concise_test" --verbose --conciseness
+# python plotter.py --log_dir "final1"
