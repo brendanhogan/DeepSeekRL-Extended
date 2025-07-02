@@ -138,7 +138,7 @@ def generate_completions(
         {'role': 'system', 'content': train_loader.system_prompt},
         {'role': 'user', 'content': question}
     ]
-    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False)
+    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
     prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
