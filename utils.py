@@ -62,13 +62,15 @@ def write_generation_log(log_data: Dict[str, Any], log_file: str) -> None:
             f.write(gen['response'] + "\n\n")
             f.write(f"#### GENERATION {i} SCORES ####\n")
             
-            # Write individual scores
-            f.write(f"Correctness: {gen['scores']['correctness']}\n")
-            f.write(f"Integer format: {gen['scores']['integer_format']}\n") 
-            f.write(f"Strict format: {gen['scores']['strict_format']}\n")
-            f.write(f"Soft format: {gen['scores']['soft_format']}\n")
-            f.write(f"XML count: {gen['scores']['xml_count']}\n")
-            f.write(f"Total reward: {gen['scores']['total_reward']}\n\n")
+            # Write individual scores (handle both GSM8K and Math500 formats)
+            scores = gen['scores']
+            f.write(f"Correctness: {scores['correctness']}\n")
+            if 'integer_format' in scores:  # GSM8K has this, Math500 doesn't
+                f.write(f"Integer format: {scores['integer_format']}\n")
+            f.write(f"Strict format: {scores['strict_format']}\n")
+            f.write(f"Soft format: {scores['soft_format']}\n")
+            f.write(f"XML count: {scores['xml_count']}\n")
+            f.write(f"Total reward: {scores['total_reward']}\n\n")
 
 
 ####################################################################################

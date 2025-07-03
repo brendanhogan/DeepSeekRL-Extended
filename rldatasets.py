@@ -77,12 +77,14 @@ class GSM8KLoader(DataLoader):
         answers (List[str]): List of corresponding answer strings
         random (bool): If True, returns problems randomly; if False, returns sequentially
         current_index (int): Current position in the lists for sequential access
+        is_training (bool): If True, cycles infinitely; if False, raises StopIteration when done
     """
     
-    def __init__(self, questions: list[str], answers: list[str], random: bool = False) -> None:
+    def __init__(self, questions: list[str], answers: list[str], random: bool = False, is_training: bool = True) -> None:
         super().__init__(random)
         self.questions = questions
         self.answers = answers
+        self.is_training = is_training
         self.pre_prompt = """You will be given a question that involves reasoning. You should reason carefully about the question, then provide your answer.
             It is very important that you put your reasoning process inside <reasoning> tags and your final answer inside <answer> tags, like this:
 
@@ -108,7 +110,12 @@ class GSM8KLoader(DataLoader):
         
     def __next__(self) -> tuple[str, str]:
         if self.current_index >= len(self.questions):
-            raise StopIteration
+            if self.is_training:
+                # For training: cycle back to beginning
+                self.current_index = 0
+            else:
+                # For test: stop iteration
+                raise StopIteration
         
         if self.random:
             idx = random.randint(0, len(self.questions) - 1)
@@ -159,8 +166,50 @@ def build_gsm8k_dataloaders() -> Tuple[GSM8KLoader, GSM8KLoader]:
     train_answers = parsed_answers[~test_mask]
 
     # Setup data loaders 
-    trainloader = GSM8KLoader(train_questions.tolist(), train_answers.tolist())
-    testloader = GSM8KLoader(test_questions.tolist(), test_answers.tolist())
+    trainloader = GSM8KLoader(train_questions.tolist(), train_answers.tolist(), is_training=True)
+    testloader = GSM8KLoader(test_questions.tolist(), test_answers.tolist(), is_training=False)
+    
+    return trainloader, testloader
+
+
+def build_math500_dataloaders() -> Tuple[DataLoader, DataLoader]:
+    """Build train/test loaders for MATH-500 dataset."""
+    data = load_dataset('HuggingFaceH4/MATH-500', split='test')
+    
+    questions = []
+    answers = []
+    
+    for item in tqdm(data, desc="Processing MATH-500"):
+        questions.append(item['problem'])
+        answers.append(item['answer'])
+    
+    # Split 90% train, 10% test
+    total_samples = len(questions)
+    test_size = int(total_samples * 0.1)
+    
+    test_indices = random.sample(range(total_samples), test_size)
+    test_indices_set = set(test_indices)
+    
+    questions = np.array(questions)
+    answers = np.array(answers)
+    
+    test_mask = np.zeros(total_samples, dtype=bool)
+    test_mask[list(test_indices_set)] = True
+    
+    test_questions = questions[test_mask]
+    test_answers = answers[test_mask]
+    train_questions = questions[~test_mask]
+    train_answers = answers[~test_mask]
+
+    # # Print length of each 
+    # print(f"Train questions: {len(train_questions)}")
+    # print(f"Test questions: {len(test_questions)}")
+    # print(f"Train answers: {len(train_answers)}")
+    # print(f"Test answers: {len(test_answers)}")
+
+
+    trainloader = GSM8KLoader(train_questions.tolist(), train_answers.tolist(), is_training=True)
+    testloader = GSM8KLoader(test_questions.tolist(), test_answers.tolist(), is_training=False)
     
     return trainloader, testloader
 
@@ -170,7 +219,7 @@ def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     Factory function to get train and test data loaders for a specified dataset.
     
     Args:
-        dataset_name (str): Name of the dataset to load ('gsm8k' currently supported)
+        dataset_name (str): Name of the dataset to load ('gsm8k' or 'math500')
         
     Returns:
         Tuple[DataLoader, DataLoader]: Train and test data loaders
@@ -180,8 +229,10 @@ def get_dataloaders(dataset_name: str) -> Tuple[DataLoader, DataLoader]:
     """
     if dataset_name.lower() == 'gsm8k':
         return build_gsm8k_dataloaders()
+    elif dataset_name.lower() == 'math500':
+        return build_math500_dataloaders()
     else:
-        raise ValueError(f"Dataset {dataset_name} not supported. Currently only 'gsm8k' is available.")
+        raise ValueError(f"Dataset {dataset_name} not supported. Available: 'gsm8k', 'math500'")
 
 
 if __name__ == "__main__": 

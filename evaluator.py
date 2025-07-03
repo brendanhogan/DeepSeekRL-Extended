@@ -7,6 +7,7 @@ import re
 import torch
 from abc import ABC, abstractmethod
 from typing import List, Dict, Tuple, Any
+import llms
 
 class RewardEvaluator(ABC):
     """
@@ -77,6 +78,8 @@ def get_evaluator(name: str) -> RewardEvaluator:
     """
     if name.lower() == "gsm8k":
         return GSM8kEvaluator()
+    elif name.lower() == "math500":
+        return Math500Evaluator()
     else:
         raise NotImplementedError(f"No evaluator implemented for {name}")
 
@@ -116,30 +119,26 @@ class GSM8kEvaluator(RewardEvaluator):
 
     def _strict_format_reward(self, completions) -> List[float]:
         """Reward for strict XML format."""
-        pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+        pattern = r"^<reason>\n.*?\n</reason>\n<answer>\n.*?\n</answer>\n$"
         responses = [completion[0]["content"] for completion in completions]
-        matches = [bool(re.match(pattern, r)) for r in responses]
+        matches = [bool(re.match(pattern, r, re.DOTALL)) for r in responses]
         return [0.5 if m else 0.0 for m in matches]
 
     def _soft_format_reward(self, completions) -> List[float]:
         """Reward for relaxed XML format."""
-        pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+        pattern = r"<reason>.*?</reason>\s*<answer>.*?</answer>"
         responses = [completion[0]["content"] for completion in completions]
-        matches = [bool(re.match(pattern, r)) for r in responses]
+        matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
         return [0.5 if m else 0.0 for m in matches]
 
     def _xml_count_reward(self, completions) -> List[float]:
         """Reward for XML tag counting."""
         def count_xml(text: str) -> float:
             count = 0.0
-            if text.count("<reasoning>\n") == 1: count += 0.125
-            if text.count("\n</reasoning>\n") == 1: count += 0.125
-            if text.count("\n<answer>\n") == 1:
-                count += 0.125
-                count -= len(text.split("\n</answer>\n")[-1])*0.001
-            if text.count("\n</answer>") == 1:
-                count += 0.125
-                count -= (len(text.split("\n</answer>")[-1]) - 1)*0.001
+            if text.count("<reason>") == 1: count += 0.125
+            if text.count("</reason>") == 1: count += 0.125
+            if text.count("<answer>") == 1: count += 0.125
+            if text.count("</answer>") == 1: count += 0.125
             return count
             
         responses = [completion[0]["content"] for completion in completions]
@@ -198,4 +197,123 @@ class GSM8kEvaluator(RewardEvaluator):
             'strict_format': reward_scores[2].item(),
             'soft_format': reward_scores[3].item(),
             'xml_count': reward_scores[4].item()
+        }
+
+
+class Math500Evaluator(RewardEvaluator):
+    """
+    Reward evaluator for the MATH-500 dataset.
+    
+    Uses GPT-4.1-nano to check mathematical equivalence for correctness.
+    Removes integer format requirement since answers can be expressions.
+    """
+    
+    def __init__(self):
+        self.num_reward_functions = 4  # One less than GSM8K (no integer format)
+        self.gpt_checker = llms.get_inference_model_interface("gpt-4.1-nano", None)
+    
+    def _extract_xml_answer(self, text: str) -> str:
+        """Extract answer from XML tags."""
+        answer = text.split("<answer>")[-1]
+        answer = answer.split("</answer>")[0]
+        return answer.strip()
+    
+    def _check_mathematical_equivalence(self, generated_answer: str, correct_answer: str) -> bool:
+        """Use GPT-4.1-nano to check if answers are mathematically equivalent."""
+        prompt = f"""Here is a generated answer to a math problem: {generated_answer}
+Here is the correct answer: {correct_answer}
+
+They may have different formats or extra text. Are they mathematically equivalent? Answer only: YES or NO
+YOU MUST ANSWER ONLY WITH YES OR NO - NO EXTRA TEXT OR EXPLANATION.
+"""
+        
+        try:
+            response = self.gpt_checker.generate(prompt, max_tokens=10)
+            return response.strip().upper() == "YES"
+        except:
+            # If GPT check fails, fall back to exact string match
+            return generated_answer.strip() == correct_answer.strip()
+    
+    def _correctness_reward(self, prompts, completions, answer) -> List[float]:
+        """Reward for mathematically correct answer using GPT-4.1-nano."""
+        responses = [completion[0]['content'] for completion in completions]
+        extracted = [self._extract_xml_answer(r) for r in responses]
+        
+        rewards = []
+        for generated, correct in zip(extracted, answer):
+            is_correct = self._check_mathematical_equivalence(generated, correct)
+            rewards.append(2.0 if is_correct else 0.0)
+        return rewards
+
+    def _strict_format_reward(self, completions) -> List[float]:
+        """Reward for strict XML format."""
+        pattern = r"^<reason>\n.*?\n</reason>\n<answer>\n.*?\n</answer>\n$"
+        responses = [completion[0]["content"] for completion in completions]
+        matches = [bool(re.match(pattern, r, re.DOTALL)) for r in responses]
+        return [0.5 if m else 0.0 for m in matches]
+
+    def _soft_format_reward(self, completions) -> List[float]:
+        """Reward for relaxed XML format."""
+        pattern = r"<reason>.*?</reason>\s*<answer>.*?</answer>"
+        responses = [completion[0]["content"] for completion in completions]
+        matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
+        return [0.5 if m else 0.0 for m in matches]
+
+    def _xml_count_reward(self, completions) -> List[float]:
+        """Reward for having exactly one set of XML tags."""
+        responses = [completion[0]["content"] for completion in completions]
+        rewards = []
+        for response in responses:
+            reason_count = response.count("<reason>") + response.count("</reason>")
+            answer_count = response.count("<answer>") + response.count("</answer>")
+            total_tags = reason_count + answer_count
+            reward = 0.5 if total_tags == 4 else 0.0
+            rewards.append(reward)
+        return rewards
+
+    def compute_rewards(
+        self,
+        prompts: List[List[Dict[str, str]]],
+        completions: List[List[Dict[str, str]]],
+        answer: Any,
+        device: str
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute rewards for MATH-500 completions."""
+        
+        # Compute individual reward functions
+        correctness_rewards = self._correctness_reward(prompts, completions, answer)
+        strict_format_rewards = self._strict_format_reward(completions)
+        soft_format_rewards = self._soft_format_reward(completions)
+        xml_count_rewards = self._xml_count_reward(completions)
+        
+        # Stack into tensor (4 reward functions)
+        rewards_per_func = torch.tensor([
+            correctness_rewards,
+            strict_format_rewards, 
+            soft_format_rewards,
+            xml_count_rewards
+        ], dtype=torch.float32, device=device).T
+        
+        # Calculate metrics
+        reward_per_func = rewards_per_func.mean(dim=0)
+        accuracy = sum(r > 0 for r in correctness_rewards) / len(correctness_rewards)
+        
+        metrics = {
+            "rewards/correctness_reward_func": reward_per_func[0].item(),
+            "rewards/strict_format_reward_func": reward_per_func[1].item(),
+            "rewards/soft_format_reward_func": reward_per_func[2].item(),
+            "rewards/xml_count_reward_func": reward_per_func[3].item(),
+            "reward": rewards_per_func.sum(dim=1).mean().item(),
+            "accuracy": accuracy
+        }
+        
+        return rewards_per_func, metrics
+
+    def get_reward_breakdown(self, reward_scores: torch.Tensor) -> Dict[str, float]:
+        """Convert reward scores tensor to labeled dictionary."""
+        return {
+            'correctness': reward_scores[0].item(),
+            'strict_format': reward_scores[1].item(),
+            'soft_format': reward_scores[2].item(),
+            'xml_count': reward_scores[3].item()
         }
