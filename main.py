@@ -14,6 +14,7 @@ import llms
 import utils
 import evaluator
 import rldatasets
+import numpy as np
 
 def eval_on_test_set(
     all_models: dict,
@@ -21,7 +22,8 @@ def eval_on_test_set(
     eval_class: evaluator.RewardEvaluator,
     device: str,
     args: argparse.Namespace,
-    round_num: int
+    eval_log_dir: str,
+    eval_log_prefix: str
 ) -> tuple[dict[str, float], float]:
     """
     Evaluate model performance on test set by comparing each model completion
@@ -33,74 +35,151 @@ def eval_on_test_set(
     num_examples = 0
     total_wins = 0
 
-    log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
+    log_file = os.path.join(eval_log_dir, f'{eval_log_prefix}.txt')
     test_loader.reset()
     
     with open(log_file, 'w') as f:
         total_comparisons = 0
         total_wins = 0
         
-        for question in tqdm(test_loader, desc="Evaluating on test set"):
+        for question in tqdm(test_loader, desc=f"Evaluating on test set ({eval_log_prefix})"):
             num_examples += 1
-
-            # 1. Prepare prompting
-            prompt = [
-                {'role': 'system', 'content': test_loader.pre_prompt},
-                {'role': 'user', 'content': question}
-            ]
-            prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False)
 
             # Log Initial prompt 
             f.write("\n" + "="*80 + "\n")
             f.write(f"Example #{num_examples}\n")
             f.write("="*80 + "\n\n")
             
-            f.write("Prompt:\n")
-            f.write(f"{prompt_text}\n\n")
+            f.write("Question:\n")
+            f.write(f"{question}\n\n")
 
-            # Generate completions from trained model
-            _, _, _, _, completions_text, _ = generate_completions(
-                all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args
+            # Generate advice and debates from our model
+            _, _, _, _, advice_texts, debate_texts = generate_advice_and_debate(
+                all_models["advice_model"], 
+                all_models["advice_model_tokenizer"], 
+                all_models["big_model"], 
+                question, 
+                device, 
+                args,
+                args.num_eval_chains
             )
 
-            # Generate completions for compare model using the interface
-            compare_completions_text = []
-            for _ in range(args.num_chains):
+            # Generate debates for compare model using generic advice
+            compare_debate_texts = []
+            for i in range(args.num_eval_chains):
+                # Use generic advice for comparison
+                generic_advice = "Produce a strong and compelling argument"
+                debate_prompt = f"""Debate Topic: {question.split('Debate Topic: ')[1].split('\\nPosition:')[0]}
+Position: {question.split('Position: ')[1]}
+
+Here is some advice on how to produce your debate:
+<advice>
+{generic_advice}
+</advice>
+
+Now provide your debate argument in the format:
+<reasoning>
+Your step-by-step reasoning process here
+</reasoning>
+<answer>
+Your clear, concise debate position
+</answer>"""
+                
                 completion = all_models["compare_model"].generate(
-                    system_prompt=test_loader.pre_prompt,
-                    user_prompt=question,
+                    system_prompt="You are a skilled debater. Provide a compelling argument following the given advice.",
+                    user_prompt=debate_prompt,
                     max_new_tokens=args.max_completion_length,
                     temperature=args.temperature
                 )
-                compare_completions_text.append(completion)
+                compare_debate_texts.append(completion)
 
-            # Score completions to get reward metrics
+            # Log the full prompts sent to big models
+            f.write("\nFULL PROMPTS SENT TO BIG MODELS:\n")
+            f.write("="*60 + "\n")
+            
+            # Log our model's prompts (with learned advice)
+            f.write("\nOUR MODEL PROMPTS (with learned advice):\n")
+            f.write("-"*40 + "\n")
+            for i, advice_text in enumerate(advice_texts):
+                our_debate_prompt = f"""Debate Topic: {question.split('Debate Topic: ')[1].split('\\nPosition:')[0]}
+Position: {question.split('Position: ')[1]}
+
+Here is some advice on how to produce your debate:
+<advice>
+{advice_text}
+</advice>
+
+Now provide your debate argument in the format:
+<reasoning>
+Your step-by-step reasoning process here
+</reasoning>
+<answer>
+Your clear, concise debate position
+</answer>"""
+                
+                f.write(f"\nPrompt #{i+1}:\n")
+                f.write(f"System: You are a skilled debater. Provide a compelling argument following the given advice.\n")
+                f.write(f"User: {our_debate_prompt}\n")
+                f.write(f"Response: {debate_texts[i]}\n")
+            
+            # Log compare model's prompts (with generic advice)
+            f.write("\nCOMPARE MODEL PROMPTS (with generic advice):\n")
+            f.write("-"*40 + "\n")
+            for i in range(args.num_eval_chains):
+                generic_advice = "Produce a strong and compelling argument"
+                compare_debate_prompt = f"""Debate Topic: {question.split('Debate Topic: ')[1].split('\\nPosition:')[0]}
+Position: {question.split('Position: ')[1]}
+
+Here is some advice on how to produce your debate:
+<advice>
+{generic_advice}
+</advice>
+
+Now provide your debate argument in the format:
+<reasoning>
+Your step-by-step reasoning process here
+</reasoning>
+<answer>
+Your clear, concise debate position
+</answer>"""
+                
+                f.write(f"\nPrompt #{i+1}:\n")
+                f.write(f"System: You are a skilled debater. Provide a compelling argument following the given advice.\n")
+                f.write(f"User: {compare_debate_prompt}\n")
+                f.write(f"Response: {compare_debate_texts[i]}\n")
+            
+            f.write("\n" + "="*60 + "\n")
+
+            # Score debates to get reward metrics
             rewards_per_func, reward_metrics = eval_class.compute_rewards(
                 input_prompt=question, 
                 all_models=all_models, 
-                train_model_completions=completions_text, 
-                compare_model_completions=compare_completions_text,
+                train_model_completions=debate_texts, 
+                compare_model_completions=compare_debate_texts,
                 device=device,
                 is_test=True
             )
 
             # Track total comparisons and wins
-            comparisons_this_question = len(completions_text)
+            comparisons_this_question = len(debate_texts)
             total_comparisons += comparisons_this_question
             total_wins += reward_metrics['num_wins']
 
             # For each completion pair, log the results
-            for i, (completion, compare_completion) in enumerate(zip(completions_text, compare_completions_text)):
+            for i, (advice_text, debate_text, compare_debate_text) in enumerate(zip(advice_texts, debate_texts, compare_debate_texts)):
                 f.write(f"\nCompletion #{i+1}:\n")
                 f.write("-"*40 + "\n\n")
 
-                # Log trained model's response
-                f.write("TRAINED MODEL RESPONSE:\n")
-                f.write(f"Full response:\n{completion}\n\n")
+                # Log advice and debate from our model
+                f.write("OUR MODEL ADVICE:\n")
+                f.write(f"{advice_text}\n\n")
+                
+                f.write("OUR MODEL DEBATE:\n")
+                f.write(f"Full response:\n{debate_text}\n\n")
                 
                 try:
-                    trained_reasoning = completion.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
-                    trained_answer = completion.split("<answer>\n")[1].split("\n</answer>")[0]
+                    trained_reasoning = debate_text.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
+                    trained_answer = debate_text.split("<answer>\n")[1].split("\n</answer>")[0]
                 except:
                     trained_reasoning = "ERROR: Could not parse reasoning"
                     trained_answer = "ERROR: Could not parse answer"
@@ -109,12 +188,12 @@ def eval_on_test_set(
                 f.write(f"Parsed answer:\n{trained_answer}\n\n")
 
                 # Log compare model's response
-                f.write("COMPARE MODEL RESPONSE:\n")
-                f.write(f"Full response:\n{compare_completion}\n\n")
+                f.write("COMPARE MODEL DEBATE:\n")
+                f.write(f"Full response:\n{compare_debate_text}\n\n")
                 
                 try:
-                    compare_reasoning = compare_completion.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
-                    compare_answer = compare_completion.split("<answer>\n")[1].split("\n</answer>")[0]
+                    compare_reasoning = compare_debate_text.split("<reasoning>\n")[1].split("\n</reasoning>")[0]
+                    compare_answer = compare_debate_text.split("<answer>\n")[1].split("\n</answer>")[0]
                 except:
                     compare_reasoning = "ERROR: Could not parse reasoning"
                     compare_answer = "ERROR: Could not parse answer"
@@ -131,14 +210,14 @@ def eval_on_test_set(
 
                 # Log if trained model won this comparison
                 trained_model_won = rewards_per_func[i,0] > 0
-                f.write(f"\nOUTCOME: Trained model {'won' if trained_model_won else 'lost'} this comparison\n")
+                f.write(f"\nOUTCOME: Our model {'won' if trained_model_won else 'lost'} this comparison\n")
                 f.write("-"*40 + "\n")
 
             # Log summary metrics for this question
             f.write("\nSUMMARY METRICS:\n")
             f.write(f"Win rate: {reward_metrics['win_rate']:.2%}\n")
             f.write(f"Number of wins: {reward_metrics['num_wins']}\n")
-            f.write(f"Total comparisons: {reward_metrics['num_comparisons']}\n")
+            f.write(f"Total comparisons: {reward_metrics['num_debates']}\n")
             f.write(f"Average format scores:\n")
             f.write(f"  Strict format: {reward_metrics['rewards/strict_format']:.4f}\n")
             f.write(f"  Soft format: {reward_metrics['rewards/soft_format']:.4f}\n")
@@ -148,7 +227,7 @@ def eval_on_test_set(
             for k, v in reward_metrics.items():
                 if k.startswith('rewards/'):
                     total_scores[k] += v
-        
+
         # Calculate final metrics
         win_rate = (total_wins / total_comparisons) * 100 if total_comparisons > 0 else 0
         avg_scores = {k: v/num_examples for k,v in total_scores.items()}
@@ -184,7 +263,7 @@ def eval_on_test_set(
                 print(f"{metric:15s}: {value:.4f}")
             print("-" * 20)
 
-    metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
+    metrics_path = os.path.join(eval_log_dir, f'{eval_log_prefix}_metrics.json')
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=4)
 
@@ -358,7 +437,7 @@ def compute_loss(
     
     Args:
         model: The current model being trained
-        base_model: The reference model to compare against
+        base_model: The reference model to compare against (can be None if use_kl is False)
         prompt_completion_ids: Combined prompt and completion token IDs
         prompt_ids: Token IDs for just the prompt
         completion_ids: Token IDs for just the completion
@@ -375,28 +454,39 @@ def compute_loss(
     # Only need the generated tokens' logits
     logits_to_keep = completion_ids.size(1)
 
-    # Get reference model logits
-    with torch.inference_mode():
-        ref_per_token_logps = utils.get_per_token_logps(base_model, prompt_completion_ids, attention_mask, logits_to_keep)
-
     # Get training model logits
     input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
     per_token_logps = utils.get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
-    # Compute KL divergence
-    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+    if args.use_kl:
+        # Get reference model logits
+        with torch.inference_mode():
+            ref_per_token_logps = utils.get_per_token_logps(base_model, prompt_completion_ids, attention_mask, logits_to_keep)
+        
+        # Compute KL divergence
+        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        
+        # Compute loss with advantages and KL penalty
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        per_token_loss = -(per_token_loss - args.kl_weight_beta * per_token_kl)
+    else:
+        # Compute loss with advantages only (no KL penalty)
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        per_token_loss = -per_token_loss
+        per_token_kl = torch.zeros_like(per_token_loss)  # For logging purposes
 
-    # Compute loss with advantages
-    per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-    per_token_loss = -(per_token_loss - args.kl_weight_beta * per_token_kl)
     loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
     # Additional metrics
     metrics = {}
     response_length = completion_mask.sum(1).float().mean().item()
     metrics["response_length"] = response_length
-    mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-    metrics["kl"] = mean_kl.item()
+    
+    if args.use_kl:
+        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        metrics["kl"] = mean_kl.item()
+    else:
+        metrics["kl"] = 0.0
 
     return loss, metrics
 
@@ -414,11 +504,9 @@ def grpo_loss(
     Compute GRPO loss between the current model and base model.
     
     Args:
-        model: The current model being trained
-        base_model: The reference model to compare against
-        tokenizer: Tokenizer for the models
+        train_loader: Data loader for training
+        all_models: Dictionary containing all models
         question: Input question/prompt
-        answer: Ground truth answer
         eval_class: Evaluator for computing rewards
         device: Device to run on ('cpu' or 'cuda')
         round_num: Current training round number
@@ -431,30 +519,63 @@ def grpo_loss(
         reward: The total reward for this batch
     """
 
-    prompt = [
-        {'role': 'system', 'content': test_loader.pre_prompt},
-        {'role': 'user', 'content': question}
-    ]
-    prompt_text = all_models["training_model_tokenizer"].apply_chat_template(prompt, tokenize=False)
-
-    # Generate completions
-    prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, _ = generate_completions(
-        all_models["training_model"], all_models["training_model_tokenizer"], prompt_text, device, args
+    # Generate advice from small model and debates from big model
+    advice_completion_ids, advice_prompt_ids, advice_completion_ids_only, advice_attention_mask, advice_texts, debate_texts = generate_advice_and_debate(
+        all_models["advice_model"], 
+        all_models["advice_model_tokenizer"], 
+        all_models["big_model"], 
+        question, 
+        device, 
+        args,
+        args.num_chains
     )
-    # Score completions
+    
+    # Log the full prompts sent to big model during training
+    log_file = os.path.join(training_log_dir, f'{round_num}_big_model_prompts.txt')
+    with open(log_file, 'w') as f:
+        f.write(f"Training Round {round_num}\n")
+        f.write(f"Question: {question}\n\n")
+        f.write("FULL PROMPTS SENT TO BIG MODEL:\n")
+        f.write("="*60 + "\n")
+        
+        for i, advice_text in enumerate(advice_texts):
+            debate_prompt = f"""Debate Topic: {question.split('Debate Topic: ')[1].split('\\nPosition:')[0]}
+Position: {question.split('Position: ')[1]}
+
+Here is some advice on how to produce your debate:
+<advice>
+{advice_text}
+</advice>
+
+Now provide your debate argument in the format:
+<reasoning>
+Your step-by-step reasoning process here
+</reasoning>
+<answer>
+Your clear, concise debate position
+</answer>"""
+            
+            f.write(f"\nPrompt #{i+1}:\n")
+            f.write(f"System: You are a skilled debater. Provide a compelling argument following the given advice.\n")
+            f.write(f"User: {debate_prompt}\n")
+            f.write(f"Response: {debate_texts[i]}\n")
+            f.write("-"*40 + "\n")
+    
+    # Score debates (not advice) - the reward comes from debate quality
     rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
-        completions_text, question, eval_class, device, args
+        debate_texts, question, eval_class, device, args
     )
 
     # Write log data
     log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
     utils.write_generation_log(log_data, log_file)
 
-    # Compute loss
-    completion_mask = attention_mask[:, prompt_ids.size(1):]
+    # Compute loss on advice tokens (not debate tokens)
+    advice_completion_mask = advice_attention_mask[:, advice_prompt_ids.size(1):]
     loss, loss_metrics = compute_loss(
-        all_models["training_model"], all_models["base_model"], prompt_completion_ids, prompt_ids, completion_ids,
-        attention_mask, completion_mask, advantages, args
+        all_models["advice_model"], all_models["advice_base_model"], 
+        advice_completion_ids, advice_prompt_ids, advice_completion_ids_only,
+        advice_attention_mask, advice_completion_mask, advantages, args
     )
 
     # Combine metrics
@@ -462,21 +583,115 @@ def grpo_loss(
 
     return loss, metrics
 
+def generate_advice_and_debate(
+    advice_model: PreTrainedModel,
+    advice_tokenizer: PreTrainedTokenizerBase,
+    big_model: ModelInterface,
+    question: str,
+    device: str,
+    args: argparse.Namespace,
+    num_chains: int = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], list[str]]:
+    """
+    Generate advice from small model, then use it to generate debates from big model.
+    
+    Args:
+        advice_model: The small model that generates advice
+        advice_tokenizer: Tokenizer for the advice model
+        big_model: The big model that generates debates
+        question: The debate question/topic
+        device: Device to run on
+        args: Training arguments
+        num_chains: Number of chains to generate (defaults to args.num_chains if None)
+        
+    Returns:
+        advice_completion_ids: Tensor containing advice token IDs
+        advice_prompt_ids: Tensor containing advice prompt token IDs  
+        advice_completion_ids_only: Tensor containing just advice completion token IDs
+        advice_attention_mask: Attention mask for advice generation
+        advice_texts: List of generated advice texts
+        debate_texts: List of generated debate texts
+    """
+    
+    # Use provided num_chains or default to args.num_chains
+    if num_chains is None:
+        num_chains = args.num_chains
+    
+    # Generate advice from small model
+    advice_prompt = [
+        {'role': 'system', 'content': 'You will provide advice to another model on how to produce the best debate argument. The model you are giving advice to will be prompted with a debate subject and asked to make a 1 paragraph debate pro or against the subject. Provide advice on how to craft the debate such that they win. Keep your advice to a paragraph or shorter.'},
+        {'role': 'user', 'content': question}
+    ]
+    advice_prompt_text = advice_tokenizer.apply_chat_template(advice_prompt, tokenize=False, add_generation_prompt=True)
+    
+    # Create a temporary args object with the correct num_chains
+    temp_args = argparse.Namespace()
+    temp_args.num_chains = num_chains
+    temp_args.max_prompt_length = args.max_prompt_length
+    temp_args.max_completion_length = args.max_completion_length
+    temp_args.temperature = args.temperature
+    
+    # Generate advice completions
+    advice_completion_ids, advice_prompt_ids, advice_completion_ids_only, advice_attention_mask, advice_texts, _ = generate_completions(
+        advice_model, advice_tokenizer, advice_prompt_text, device, temp_args
+    )
+
+    # log the full advice prompt and completions to tmp.txt 
+    with open('tmp.txt', 'w') as f:
+        f.write(f"Advice Prompt: {advice_prompt_text}\n")
+        f.write(f"\nNumber of Completions: {len(advice_texts)}\n\n")
+        f.write("Individual Completions:\n")
+        for i, completion in enumerate(advice_texts, 1):
+            f.write(f"\nCompletion #{i}:\n{completion}\n")
+
+    # Generate debates from big model using the advice
+    debate_texts = []
+    for advice_text in advice_texts:
+        # Format the debate prompt with advice
+        debate_prompt = f"""Debate Topic: {question.split('Debate Topic: ')[1].split('\\nPosition:')[0]}
+Position: {question.split('Position: ')[1]}
+
+Here is some advice on how to produce your debate:
+<advice>
+{advice_text}
+</advice>
+
+Now provide your debate argument in the format:
+<reasoning>
+Your step-by-step reasoning process here
+</reasoning>
+<answer>
+Your clear, concise debate position
+</answer>"""
+        
+        # Generate debate from big model
+        debate_response = big_model.generate(
+            system_prompt="You are a skilled debater. Provide a compelling argument following the given advice.",
+            user_prompt=debate_prompt,
+            max_new_tokens=args.max_completion_length,
+            temperature=args.temperature
+        )
+        debate_texts.append(debate_response)
+    
+    return advice_completion_ids, advice_prompt_ids, advice_completion_ids_only, advice_attention_mask, advice_texts, debate_texts
+
 def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
     
     # Model configuration
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name/path of base model")
-    parser.add_argument("--judge_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name of model to use as judge")
-    parser.add_argument("--compare_model_name", type=str, default="gpt-4o-mini", help="Name of model to use for comparison")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct", help="Name/path of advice model (small model to train)")
+    parser.add_argument("--big_model_name", type=str, default="gpt-4.1-nano", help="Name of big model to use for debate generation")
+    parser.add_argument("--judge_model_name", type=str, default="gpt-4o-mini", help="Name of model to use as judge")
+    parser.add_argument("--compare_model_name", type=str, default="gpt-4.1-nano", help="Name of model to use for comparison")
     parser.add_argument("--dataset_name", type=str, default="debate", choices=["debate", "ld", "chopped"], help="Dataset to use for training")
     parser.add_argument("--evaluator", type=str, default="debate", choices=["debate", "ld", "chopped"], help="Evaluator to use for scoring")
 
     # Output and logging
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--save_steps", type=int, default=80, help="Save model every N steps")
+    parser.add_argument("--save_steps", type=int, default=1000, help="Save model every N steps")
     parser.add_argument("--eval_iterations", type=int, default=40, help="Number of iterations for evaluation")
+    parser.add_argument("--num_eval_runs_per_step", type=int, default=5, help="Number of times to run evaluation at each eval step")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
 
     # Optimization hyperparameters
@@ -494,7 +709,8 @@ def parse_args():
 
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature")
-    parser.add_argument("--num_chains", type=int, default=16, help="Number of parallel generation chains")
+    parser.add_argument("--num_chains", type=int, default=6, help="Number of parallel generation chains")
+    parser.add_argument("--num_eval_chains", type=int, default=2, help="Number of parallel generation chains for evaluation")
     parser.add_argument("--max_prompt_length", type=int, default=256, help="Maximum prompt length")
     parser.add_argument("--max_completion_length", type=int, default=786, help="Maximum completion length")
 
@@ -502,6 +718,7 @@ def parse_args():
     parser.add_argument("--num_train_iters", type=int, default=1000, help="Number of training iterations")
     parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
     parser.add_argument("--seed", type=int, default=7111994, help="Random seed")
+    parser.add_argument("--use_kl", action="store_true", help="Whether to use KL divergence in loss")
 
     args = parser.parse_args()
     return args
@@ -520,19 +737,29 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('high') 
 
     ## Set which model to train 
-    model, tokenizer = llms.get_llm_tokenizer(args.model_name, device)
-    base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
+    # Load the advice model (small model to train)
+    advice_model, advice_tokenizer = llms.get_llm_tokenizer(args.model_name, device)
+    
+    # Only load base model if using KL divergence
+    if args.use_kl:
+        advice_base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
+    else:
+        advice_base_model = None
+
+    # Load the big model for debate generation
+    big_model = llms.get_compare_model(args.big_model_name, device)
 
     # Get judge and compare models using the new interfaces
     judge_model = llms.get_judge_model(args.judge_model_name, device)
     compare_model = llms.get_compare_model(args.compare_model_name, device)
     
-    # Simplified all_models dictionary
+    # Updated all_models dictionary with both advice and big models
     all_models = {
-        "training_model": model,
-        "training_model_tokenizer": tokenizer,
-        "base_model": base_model,
-        "base_model_tokenizer": tokenizer,
+        "advice_model": advice_model,
+        "advice_model_tokenizer": advice_tokenizer,
+        "advice_base_model": advice_base_model,
+        "advice_base_model_tokenizer": advice_tokenizer if args.use_kl else None,
+        "big_model": big_model,
         "judge_model": judge_model,
         "compare_model": compare_model
     }
@@ -559,7 +786,7 @@ if __name__ == "__main__":
 
     # Setup optimizer for trainer agent with GRPO config settings
     optimizer = torch.optim.AdamW(
-        all_models["training_model"].parameters(),
+        all_models["advice_model"].parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
@@ -582,7 +809,7 @@ if __name__ == "__main__":
             latest_checkpoint = checkpoints[-1]
             checkpoint_path = os.path.join(checkpoint_dir, f'step_{latest_checkpoint}.pt')
             checkpoint = torch.load(checkpoint_path)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            advice_model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_round = checkpoint['round_num'] + 1
@@ -602,40 +829,61 @@ if __name__ == "__main__":
         print(f"Round {round_num}")
         # Evaluate on test set every so often 
         if round_num % args.eval_iterations == 0:
-            eval_metrics, eval_accuracy = eval_on_test_set(
-                all_models=all_models,
-                test_loader=test_loader,
-                eval_class=eval_class,
-                device=device,
-                args=args,
-                round_num=round_num
-            )
+            step_eval_log_dir = os.path.join(eval_log_dir, f'round_{round_num}')
+            os.makedirs(step_eval_log_dir, exist_ok=True)
 
+            win_rates = []
+            all_run_metrics = []
+
+            print(f"--- Starting evaluation for training round {round_num} ---")
+            for i in range(args.num_eval_runs_per_step):
+                eval_metrics, win_rate = eval_on_test_set(
+                    all_models=all_models,
+                    test_loader=test_loader,
+                    eval_class=eval_class,
+                    device=device,
+                    args=args,
+                    eval_log_dir=step_eval_log_dir,
+                    eval_log_prefix=f'run_{i+1}'
+                )
+                win_rates.append(win_rate)
+                all_run_metrics.append(eval_metrics)
             
-            # Save metrics to eval log dir
-            metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
-            with open(metrics_path, 'w') as f:
-                json.dump({
-                    'metrics': eval_metrics,
-                    'accuracy': eval_accuracy
-                }, f, indent=4)
+            # Calculate stats
+            mean_win_rate = np.mean(win_rates)
+            std_win_rate = np.std(win_rates)
+
+            # Save summary stats
+            summary_stats = {
+                'round_num': round_num,
+                'mean_win_rate': mean_win_rate,
+                'std_win_rate': std_win_rate,
+                'individual_runs': {f'run_{i+1}': metrics for i, metrics in enumerate(all_run_metrics)}
+            }
+
+            summary_path = os.path.join(step_eval_log_dir, 'summary_stats.json')
+            with open(summary_path, 'w') as f:
+                json.dump(summary_stats, f, indent=4)
+            
+            print(f"--- Evaluation for round {round_num} complete ---")
+            print(f"Mean Win Rate: {mean_win_rate:.2f}% (Std Dev: {std_win_rate:.2f})")
 
         # Save checkpoint
-        if (round_num + 1) % args.save_steps == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f'step_{round_num}.pt')
-            torch.save({
-                'round_num': round_num,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_metrics_total': train_metrics_total
-            }, checkpoint_path)
+        # if (round_num + 1) % args.save_steps == 0:
+        #     checkpoint_path = os.path.join(checkpoint_dir, f'step_{round_num}.pt')
+        #     torch.save({
+        #         'round_num': round_num,
+        #         'model_state_dict': advice_model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'scheduler_state_dict': scheduler.state_dict(),
+        #         'train_metrics_total': train_metrics_total
+        #     }, checkpoint_path)
 
         # Slowly update ref model
-        if args.update_ref_model and (round_num+1) % args.update_ref_model_freq == 0:
-            with torch.no_grad():
-                for param, ref_param in zip(model.parameters(), base_model.parameters()):
-                    ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
+        # if args.use_kl and args.update_ref_model and (round_num+1) % args.update_ref_model_freq == 0:
+        #     with torch.no_grad():
+        #         for param, ref_param in zip(advice_model.parameters(), advice_base_model.parameters()):
+        #             ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
 
         # Get next question
         question = next(train_loader)
@@ -650,15 +898,16 @@ if __name__ == "__main__":
         scheduler.step()
 
         # Step optimizer
+
         if (round_num + 1) % args.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(advice_model.parameters(), args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()    
 
         # Logs
         train_metrics["learning_rate"] = scheduler.get_last_lr()[0]
         train_metrics["loss"] = total_loss.item() * args.gradient_accumulation_steps
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(advice_model.parameters(), float('inf')).item()
         train_metrics["grad_norm"] = grad_norm
         train_metrics_total[round_num] = train_metrics
         with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:

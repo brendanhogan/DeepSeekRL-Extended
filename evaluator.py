@@ -99,28 +99,32 @@ class DebateEvaluator(RewardEvaluator):
     
     def __init__(self):
         self.num_reward_functions = 4  # debate score + 3 format rewards
-        self.judge_prompt = """You are an impartial debate judge. You will be shown two debate responses on the same topic, 
-        arguing the same side (PRO or CON). Your task is to determine which argument was more compelling based on:
-        1. Logical reasoning and evidence
-        2. Clear structure and organization
-        3. Effective use of examples
-        4. Respectful tone
-        5. Addressing potential counterarguments
-        
-        Topic: {topic}
-        
-        Argument 1:
-        {arg1_response}
-        
-        Argument 2:
-        {arg2_response}
-        
-        Which response was more compelling? Respond with EXACTLY one of these options:
-        - ARGUMENT_1_WINS
-        - ARGUMENT_2_WINS
+        self.judge_prompt = """You are an impartial debate judge. Your task is to evaluate two arguments on a given topic and decide which one is more compelling.
 
-        YOU MUST CHOOSE A WINNER, A TIE IS NOT ALLOWED
-        """
+First, you will think through the evaluation step-by-step inside a <thinking> block. Analyze each argument against the following rubric:
+1.  **Logical Coherence (40%)**: Is the argument well-reasoned, logical, and free of fallacies?
+2.  **Evidence and Examples (30%)**: Are claims supported by relevant evidence, examples, or data?
+3.  **Clarity and Structure (20%)**: Is the argument clearly structured and easy to follow?
+4.  **Persuasiveness (10%)**: How persuasive is the argument overall? Does it effectively address the core issue?
+
+Second, after your reasoning, you will provide your final decision in an <evaluation> block. The decision must be one of the following, and nothing else:
+- ARGUMENT_1_WINS
+- ARGUMENT_2_WINS
+
+A tie is not allowed.
+
+Here is the debate:
+
+Topic: {topic}
+
+Argument 1:
+{arg1_response}
+
+Argument 2:
+{arg2_response}
+
+Now, provide your evaluation.
+"""
         
     def _extract_xml_answer(self, text: str) -> str:
         """Extract the answer portion from XML tags."""
@@ -191,14 +195,21 @@ class DebateEvaluator(RewardEvaluator):
                 judge_response = all_models["judge_model"].generate(
                     system_prompt="You are an impartial debate judge.",
                     user_prompt=judge_prompt,
-                    max_new_tokens=50,
+                    max_new_tokens=512,
                     temperature=0.1
                 ).strip().upper()
                 
-                if "ARGUMENT_1_WINS" in judge_response:
+                decision = ""
+                if "<EVALUATION>" in judge_response:
+                    try:
+                        decision = judge_response.split("<EVALUATION>")[-1].split("</EVALUATION>")[0].strip()
+                    except IndexError:
+                        decision = ""
+
+                if "ARGUMENT_1_WINS" in decision:
                     wins[i] += 1
                     losses[j] += 1
-                elif "ARGUMENT_2_WINS" in judge_response:
+                else:
                     wins[j] += 1
                     losses[i] += 1
 
@@ -285,11 +296,18 @@ class DebateEvaluator(RewardEvaluator):
             judge_response = all_models["judge_model"].generate(
                 system_prompt="You are an impartial debate judge.",
                 user_prompt=judge_prompt,
-                max_new_tokens=50,
+                max_new_tokens=512,
                 temperature=0.1
             ).strip().upper()
             
-            if "ARGUMENT_1_WINS" in judge_response:
+            decision = ""
+            if "<EVALUATION>" in judge_response:
+                try:
+                    decision = judge_response.split("<EVALUATION>")[-1].split("</EVALUATION>")[0].strip()
+                except IndexError:
+                    decision = ""
+
+            if "ARGUMENT_1_WINS" in decision:
                 score = 1.0
                 rewards_per_func[i, 0] = score
                 wins += 1
