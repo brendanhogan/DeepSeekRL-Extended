@@ -2,13 +2,20 @@
 # DeepSeek R1 Implementation
 
 ## Motivation
-I wanted to recreate DeepSeek R1's  results at a smaller scale, focusing on understanding the core mechanics by implementing everything from scratch. So this is a repo that trains Qwen1.5B on the [grade school math dataset](https://github.com/openai/grade-school-math).
+I wanted to recreate DeepSeek R1's results at a smaller scale, focusing on understanding the core mechanics by implementing everything from scratch. This repository trains Qwen1.5B on various reasoning datasets including the [grade school math dataset](https://github.com/openai/grade-school-math), with extensive enhancements for advanced token generation strategies and multi-dataset support.
 
 This implementation heavily borrows from [Will Brown's  work](https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb) ([@willccbb](https://x.com/willccbb)), but restructures the code into a format optimized for learning and experimentation.
 
 The key difference in my implementation is computing the GRPO loss function directly rather than using external RL libraries, and reformatting into a multi script repo.
 
-I hope this might help other people understand things better, and maybe provide an easier way to try out smaller scale ideas etc. 
+The implementation now includes several major enhancements:
+- **Advanced Token Generation**: Mixture-of-token generation with phase transitions, supporting various sampling strategies (nucleus, Dirichlet, element-wise max)
+- **Multi-Dataset Support**: Extended beyond GSM8K to include Reasoning Gym datasets, MBPP, LeetCode, and Math500
+- **Safe Code Execution**: Subprocess-based code execution for programming tasks with crash protection
+- **Enhanced Evaluation**: LLM-based answer evaluation and sophisticated reward functions
+- **Comprehensive Logging**: Detailed generation logs with phase transition tracking and token selection analysis
+
+I hope this might help other people understand things better, and maybe provide an easier way to try out smaller scale ideas etc.
 
 ## Installation
 ```
@@ -26,16 +33,36 @@ huggingface-cli login
 The system consists of several key modules:
 
 ### main.py
-Contains the core training loop implementing GRPO (Generalized Reward-Powered Optimization). Handles model training, evaluation, and metric tracking. 
+Contains the core training loop implementing GRPO (Generalized Reward-Powered Optimization). Features advanced generation capabilities including:
+- Mixture-of-token generation with phase transitions
+- Multiple sampling strategies (nucleus, Dirichlet, element-wise max)
+- Comprehensive logging of generation steps and token selection
+- Enhanced loss computation with embedding-based token selection
 
-### llms.py 
-Manages model loading and configuration, currently supporting LLaMA + Qwen models through Hugging Face's transformers library. Designed to be easily extensible to other model architectures.
+### llms.py
+Manages model loading and configuration with enhanced features:
+- Support for LLaMA and Qwen models through Hugging Face's transformers library
+- Conditional flash attention support based on model type
+- Optimized model loading for different architectures
 
 ### rldatasets.py
-Handles dataset loading and preprocessing, currently focused on GSM8K math problems. Implements custom data loaders for both training and evaluation.
+Handles dataset loading and preprocessing with expanded support:
+- GSM8K, Math500, MBPP, and LeetCode datasets
+- Full Reasoning Gym integration with task-specific configurations
+- Flexible data loaders with custom preprocessing for different data formats
 
 ### evaluator.py
-Contains evaluation metrics and reward functions, closely following DeepSeek's original implementation.
+Contains evaluation metrics and reward functions with major enhancements:
+- LLM-based answer evaluation using OpenAI API
+- Safe subprocess execution for programming tasks with crash protection
+- Reasoning Gym dataset scoring with custom reward functions
+- Timeout handling and robust error management
+
+### utils.py
+Utility functions supporting advanced token processing:
+- Memory-efficient selective log softmax operations
+- Multiple token embedding and log probability computation methods
+- Enhanced generation logging with dataset-specific formatting
 
 ### token_analysis.py
 Provides detailed analysis of token probability distributions during single inference traces. Analyzes entropy patterns, token consistency, and probability landscapes to understand model behavior during generation.
@@ -102,19 +129,54 @@ Training was conducted on a single H100 GPU. After ~400 training steps:
 
 ![Training Results](plots/train_score.png)
 
-And results on the validation set - this shows a clearer sign of learning: 
+And results on the validation set - this shows a clearer sign of learning:
 ![Eval Results](plots/eval_score.png)
+
+## New Features
+
+### Mixture-of-Token Generation
+The implementation now supports advanced token generation strategies:
+- **Phase Transitions**: Automatic switching between mixture and normal generation modes using `</think>` token triggers
+- **Multiple Sampling Strategies**:
+  - Standard mixture sampling with top-k token selection
+  - Nucleus sampling for dynamic token selection
+  - Dirichlet sampling for probabilistic mixture weights
+  - Element-wise max for deterministic selection
+- **Token Embedding Tracking**: Detailed logging of token embeddings and selection probabilities
+
+### Multi-Dataset Support
+Extended beyond GSM8K to support:
+- **GSM8K**: Original grade school math problems
+- **Math500**: More challenging math problems
+- **MBPP**: Python programming problems with safe execution
+- **LeetCode**: Competitive programming problems
+- **Reasoning Gym**: Various reasoning tasks (shortest path, family relationships, number sequences, maze, sokoban)
+
+### Advanced Configuration
+The training script supports numerous experimental configurations:
+- `--experiment_name`: Configure different token generation strategies
+- `--mixture_k`: Control number of tokens in mixture
+- `--loss_on_all_tokens`: Toggle loss computation strategy
+- `--normal_generation`: Fallback to standard generation for comparison
 
 ## Future Directions
 I'm really pleased to see how well the key mechanics work even in this simplified implementation. Building on this, I am very excited about several directions:
 
-1. Adding self-play capabilities where agents compete and learn from each other using relative rewards. This would create a more dynamic training environment where the reward signal comes from agent interactions rather than fixed metrics.
+1. **Self-play capabilities** where agents compete and learn from each other using relative rewards. This would create a more dynamic training environment where the reward signal comes from agent interactions rather than fixed metrics.
 
-2. Implementing soft reward structures, particularly for complex reasoning tasks. I've writing a framework for AI debate that I'm excited to try out.
+2. **Implementing soft reward structures**, particularly for complex reasoning tasks. I've written a framework for AI debate that I'm excited to try out.
 
-3. Expanding into vision-language models (VLMs) to improve world modeling capabilities. I have an idea about using R1-style training to enhance how VLMs build and maintain internal world models that I'm really excited to explore. (Really excited about this idea - if anyone else is interested I would love to talk.)
+3. **Expanding into vision-language models (VLMs)** to improve world modeling capabilities. I have an idea about using R1-style training to enhance how VLMs build and maintain internal world models that I'm really excited to explore. (Really excited about this idea - if anyone else is interested I would love to talk.)
 
-4. I'd like to do all this experimentation in this framework, so I need to make things faster, and support multi-gpu training.
+4. **I'd like to do all this experimentation in this framework**, so I need to make things faster, and support multi-gpu training.
+
+5. **Enhanced mixture-of-token strategies** - exploring more sophisticated token selection mechanisms and phase transition triggers.
+
+6. **Multi-model architectures** - extending beyond Qwen to support other model families and hybrid architectures.
+
+7. **Advanced evaluation frameworks** - developing more sophisticated reward functions and evaluation metrics for different task domains.
+
+8. **Production optimization** - implementing model distillation, quantization, and other techniques for deployment.
 
 
 
